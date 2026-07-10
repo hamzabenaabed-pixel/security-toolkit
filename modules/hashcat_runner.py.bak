@@ -1,0 +1,498 @@
+#!/usr/bin/env python3
+"""Hashcat Integration - Enhanced Version"""
+import os
+import shutil
+import subprocess
+import time
+import hashlib
+import hmac as hmac_mod
+from pathlib import Path
+from typing import Optional, Callable, Dict, Any, List
+from dataclasses import dataclass, field
+from enum import Enum
+
+HANDSHAKE_DIR = Path(__file__).parent.parent / "data" / "handshakes"
+MAX_OUTPUT_LINES = 5000  # حد أقصى لتخزين السجلات
+
+
+class CrackStatus(Enum):
+    CRACKED = "cracked"
+    EXHAUSTED = "exhausted"
+    STOPPED = "stopped"
+    ERROR = "error"
+    NO_DEVICE = "no_device"
+
+
+@dataclass
+class CrackResult:
+    status: CrackStatus
+    password: Optional[str] = None
+    message: Optional[str] = None
+    tested: int = 0
+    elapsed: float = 0.0
+    speed: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = {"status": self.status.value}
+        if self.password:
+            d["password"] = self.password
+        if self.message:
+            d["message"] = self.message
+        if self.tested:
+            d["tested"] = self.tested
+        if self.elapsed:
+            d["elapsed"] = round(self.elapsed, 1)
+        if self.speed:
+            d["speed"] = round(self.speed, 1)
+        return d
+
+
+@dataclass
+class CaptureInfo:
+    file: str
+    name: str
+    size: int
+    modified: float
+
+
+class HashcatRunner:
+    """
+    واجهة تشغيل Hashcat مع بديل Python للأنظمة بدون GPU.
+    يدعم:
+      - WPA/WPA2 handshake (.hc22000)
+      - PMKID cracking (Python fallback)
+    """
+
+    def __init__(self):
+        self.process: Optional[subprocess.Popen] = None
+        self.output: List[str] = []
+        self.callback: Optional[Callable[[str, str], None]] = None
+        # callback(message: str, msg_type: str)
+        # msg_type: "log" | "progress" | "result" | "error"
+
+    # ─── التحقق من البيئة ─────────────────────────────
+
+    def is_installed(self) -> bool:
+        """التحقق من وجود hashcat في النظام."""
+        return shutil.which("hashcat") is not None
+
+    def get_version(self) -> Optional[str]:
+        """الحصول على إصدار hashcat."""
+        try:
+            result = subprocess.run(
+                ["hashcat", "--version"],
+                capture_output=True, text=True, timeout=10
+            )
+            return result.stdout.strip() or None
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return None
+
+    # ─── إدارة الملفات ────────────────────────────────
+
+    def list_captures(self) -> List[CaptureInfo]:
+        """عرض جميع ملفات الالتقاط المتاحة."""
+        if not HANDSHAKE_DIR.exists():
+            return []
+
+        captures = []
+        for f in sorted(
+            HANDSHAKE_DIR.glob("*.hc22000"),
+            key=os.path.getmtime,
+            reverse=True
+        ):
+            stat = f.stat()
+            captures.append(CaptureInfo(
+                file=str(f),
+                name=f.name,
+                size=stat.st_size,
+                modified=stat.st_mtime
+            ))
+        return captures
+
+    # ─── الاقتحام الرئيسي ──────────────────────────────
+
+    def crack(
+        self,
+        capture_file: str,
+        wordlist: str,
+        rules: Optional[str] = None,
+        callback: Optional[Callable] = None,
+    ) -> CrackResult:
+        """
+        محاولة اقتحام handshake.
+
+        Args:
+            capture_file: مسار ملف .hc22000
+            wordlist: مسار قائمة كلمات المرور
+            rules: مسار ملف القواعد (اختياري)
+            callback: دالة استقبال التحديثات
+
+        Returns:
+            CrackResult مع النتيجة
+        """
+        self.output = []
+        self.callback = callback
+
+        # التحقق من الملفات
+        if not Path(capture_file).is_file():
+            return CrackResult(
+                status=CrackStatus.ERROR,
+                message=f"ملف الالتقاط غير موجود: {capture_file}"
+            )
+        if not Path(wordlist).is_file():
+            return CrackResult(
+                status=CrackStatus.ERROR,
+                message=f"قائمة الكلمات غير موجودة: {wordlist}"
+            )
+
+        total = self._count_words(wordlist)
+        self._log("capture", f"Capture : {Path(capture_file).name}")
+        self._log("log", f"Wordlist: {Path(wordlist).name} ({total:,} passwords)")
+
+        # محاولة hashcat
+        if self.is_installed():
+            result = self._try_hashcat(capture_file, wordlist, rules)
+            if result.status == CrackStatus.CRACKED:
+                return result
+            if result.status == CrackStatus.STOPPED:
+                return result
+            self._log("log", "\n[hashcat لم ينجح - التحويل إلى Python cracker]")
+
+        # البديل: Python
+        self._log("log", "\n▶ تشغيل Python cracker...")
+        return self._python_crack(capture_file, wordlist)
+
+    # ─── تشغيل Hashcat ────────────────────────────────
+
+    def _try_hashcat(
+        self,
+        capture_file: str,
+        wordlist: str,
+        rules: Optional[str],
+    ) -> CrackResult:
+        """محاولة الاقتحام باستخدام hashcat."""
+        self._log("log", "\nمحاولة hashcat -m 22000...")
+
+        cmd = [
+            "hashcat", "-m", "22000",
+            "--force",
+            "--status",              # تفعيل التحديثات
+            "--status-json",         # صيغة JSON للحالة
+            capture_file,
+            wordlist,
+        ]
+        if rules:
+            cmd.extend(["-r", rules])
+
+        try:
+            self.process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+
+            no_devices = False
+            for line in iter(self.process.stdout.readline, ""):
+                line = line.rstrip("\n")
+                self._append_output(line)
+
+                # تصنيف نوع الرسالة
+                if "No devices" in line or "No OpenCL" in line:
+                    no_devices = True
+                    self._log("error", line)
+                elif "%" in line and ("Speed" in line or "Progress" in line):
+                    self._log("progress", line)
+                else:
+                    self._log("log", line)
+
+            self.process.wait()
+
+            if no_devices:
+                return CrackResult(
+                    status=CrackStatus.NO_DEVICE,
+                    message="لا توجد أجهزة GPU/OpenCL"
+                )
+
+            if self.process.returncode == 0:
+                return self._parse_hashcat_result()
+
+            return CrackResult(
+                status=CrackStatus.ERROR,
+                message=f"hashcat انتهى برمز: {self.process.returncode}"
+            )
+
+        except FileNotFoundError:
+            return CrackResult(
+                status=CrackStatus.ERROR,
+                message="hashcat غير موجود"
+            )
+        except KeyboardInterrupt:
+            self.stop()
+            return CrackResult(status=CrackStatus.STOPPED)
+        except Exception as e:
+            return CrackResult(
+                status=CrackStatus.ERROR,
+                message=f"خطأ hashcat: {e}"
+            )
+
+    def _parse_hashcat_result(self) -> CrackResult:
+        """
+        تحليل مُحسَّن لنتائج hashcat.
+        يستخدم crack file إذا كان متاحاً.
+        """
+        # البحث عن كلمة السر في المخرجات
+        # hashcat يعرضها في السطر الأخير غير الفارغ
+        for line in reversed(self.output):
+            line = line.strip()
+
+            # تخطي الأسطر الفارغة والتعليقات
+            if not line or line.startswith("[") or line.startswith("#"):
+                continue
+
+            # تحقق من حالة الاستنزاف
+            if "Exhausted" in line:
+                return CrackResult(status=CrackStatus.EXHAUSTED)
+
+            # الأسطر التي تحتوي على hash:password
+            if ":" in line and not any(
+                kw in line for kw in [
+                    "Started", "Stopped", "Session", "Status",
+                    "Progress", "Speed", "Time", "Running",
+                    "Recovered", "Input", "Hardware", "Initializing",
+                    "Approaching", "Cracked", "hashcat",
+                ]
+            ):
+                parts = line.rsplit(":", 1)
+                if len(parts) == 2:
+                    candidate = parts[1].strip()
+                    if 8 <= len(candidate) <= 63:  # WPA: 8-63 حرف
+                        return CrackResult(
+                            status=CrackStatus.CRACKED,
+                            password=candidate,
+                        )
+
+        return CrackResult(status=CrackStatus.EXHAUSTED)
+
+    # ─── Python Cracker (PMKID) ───────────────────────
+
+    def _python_crack(
+        self, capture_file: str, wordlist: str
+    ) -> CrackResult:
+        """الاقتحام بـ Python كبديل."""
+        try:
+            content = Path(capture_file).read_text(errors="ignore").strip()
+        except Exception as e:
+            return CrackResult(
+                status=CrackStatus.ERROR,
+                message=f"لا يمكن قراءة الملف: {e}"
+            )
+
+        lines = content.splitlines()
+        if not lines:
+            return CrackResult(
+                status=CrackStatus.ERROR,
+                message="الملف فارغ"
+            )
+
+        first = lines[0].strip()
+
+        if first.startswith("PMKID:"):
+            return self._crack_pmkid(first, wordlist)
+        elif first.startswith("WPA*"):
+            self._log("log", "[Handshake كامل - يحتاج hashcat مع GPU]")
+            self._log("log", "[انقل الملف إلى جهاز فيه hashcat/GPU]")
+            return CrackResult(
+                status=CrackStatus.ERROR,
+                message="Handshake كامل يحتاج hashcat/GPU"
+            )
+        else:
+            return CrackResult(
+                status=CrackStatus.ERROR,
+                message=f"صيغة غير معروفة: {first[:50]}"
+            )
+
+    def _crack_pmkid(
+        self, content: str, wordlist: str
+    ) -> CrackResult:
+        """
+        اقتحام PMKID باستخدام PBKDF2.
+        
+        صيغة hc22000 للـ PMKID:
+          PMKID:*PMKID*BSSID*STA*ESSID
+        """
+        # تحليل الصيغة
+        if ":" not in content:
+            return CrackResult(
+                status=CrackStatus.ERROR,
+                message="صيغة PMKID غير صالحة"
+            )
+
+        parts = content.split(":", 1)[1].strip().split("*")
+        if len(parts) < 4:
+            return CrackResult(
+                status=CrackStatus.ERROR,
+                message=f"عدد الحقول غير كافٍ ({len(parts)}/4)"
+            )
+
+        target_pmkid = parts[0].upper()
+        try:
+            bssid = bytes.fromhex(parts[1])
+            sta = bytes.fromhex(parts[2])
+            essid = bytes.fromhex(parts[3])
+        except ValueError as e:
+            return CrackResult(
+                status=CrackStatus.ERROR,
+                message=f"خطأ في بيانات hex: {e}"
+            )
+
+        if len(target_pmkid) != 32:  # 16 bytes = 32 hex chars
+            return CrackResult(
+                status=CrackStatus.ERROR,
+                message="طول PMKID غير صحيح"
+            )
+
+        essid_str = essid.decode("utf-8", errors="replace")
+        self._log("log", f"PMKID : {target_pmkid}")
+        self._log("log", f"ESSID : {essid_str}")
+        self._log("log", f"BSSID : {parts[1]}")
+        self._log("log", f"STA   : {parts[2]}")
+        self._log("log", "")
+
+        # حساب HMAC message مرة واحدة
+        hmac_msg = b"PMK Name" + bssid + sta
+
+        count = 0
+        start_time = time.time()
+        last_report = start_time
+
+        try:
+            with open(wordlist, "r", errors="ignore") as f:
+                for line in f:
+                    password = line.strip()
+                    if not password or len(password) < 8 or len(password) > 63:
+                        continue
+
+                    count += 1
+
+                    # PBKDF2-HMAC-SHA1 → PMK (32 bytes)
+                    pmk = hashlib.pbkdf2_hmac(
+                        "sha1",
+                        password.encode("utf-8"),
+                        essid,
+                        4096,
+                        dklen=32,
+                    )
+
+                    # HMAC-SHA1 → PMKID (أول 16 bytes)
+                    pmkid = hmac_mod.new(
+                        pmk, hmac_msg, hashlib.sha1
+                    ).digest()[:16].hex().upper()
+
+                    if pmkid == target_pmkid:
+                        elapsed = time.time() - start_time
+                        self._log("result", "=" * 50)
+                        self._log("result", f"✓ KEY FOUND: [{password}]")
+                        self._log("result", f"  Tested : {count:,}")
+                        self._log("result", f"  Time   : {elapsed:.1f}s")
+                        self._log("result", f"  Speed  : {count/elapsed:.0f}/s")
+                        self._log("result", "=" * 50)
+                        return CrackResult(
+                            status=CrackStatus.CRACKED,
+                            password=password,
+                            tested=count,
+                            elapsed=elapsed,
+                            speed=count / elapsed if elapsed > 0 else 0,
+                        )
+
+                    # تحديث التقدم كل ثانية
+                    now = time.time()
+                    if now - last_report >= 1.0:
+                        elapsed = now - start_time
+                        speed = count / elapsed if elapsed > 0 else 0
+                        self._log(
+                            "progress",
+                            f"  Tested: {count:,} ({speed:.0f}/s)"
+                        )
+                        last_report = now
+
+            elapsed = time.time() - start_time
+            self._log("log", f"\nانتهى الاختبار: {count:,} كلمة - لم يُعثر عليها")
+            return CrackResult(
+                status=CrackStatus.EXHAUSTED,
+                tested=count,
+                elapsed=elapsed,
+                speed=count / elapsed if elapsed > 0 else 0,
+            )
+
+        except KeyboardInterrupt:
+            elapsed = time.time() - start_time
+            self._log("log", f"\nتوقف عند: {count:,}")
+            return CrackResult(
+                status=CrackStatus.STOPPED,
+                tested=count,
+                elapsed=elapsed,
+            )
+        except Exception as e:
+            return CrackResult(
+                status=CrackStatus.ERROR,
+                message=str(e)
+            )
+
+    # ─── التحكم في العملية ────────────────────────────
+
+    def stop(self):
+        """إيقاف العملية الجارية."""
+        if self.process and self.process.poll() is None:
+            try:
+                self.process.terminate()
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                try:
+                    self.process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    pass
+            except OSError:
+                pass
+
+    # ─── أدوات مساعدة ─────────────────────────────────
+
+    @staticmethod
+    def _count_words(wordlist: str) -> int:
+        """عد كلمات المرور في القائمة بكفاءة."""
+        count = 0
+        try:
+            with open(wordlist, "rb") as f:
+                for chunk in iter(lambda: f.read(8192), b""):
+                    count += chunk.count(b"\n")
+        except Exception:
+            return 0
+        return count
+
+    def _append_output(self, line: str):
+        """إضافة سطر مع الحد من الحجم."""
+        if len(self.output) >= MAX_OUTPUT_LINES:
+            # الاحتفاظ بالنصف الأخير
+            self.output = self.output[MAX_OUTPUT_LINES // 2:]
+        self.output.append(line)
+
+    def _log(self, msg_type: str, msg: str):
+        """
+        تسجيل رسالة مع تصنيفها.
+        
+        msg_type:
+          - "log"      : رسالة عامة
+          - "progress" : تحديث تقدم
+          - "result"   : نتيجة نهائية
+          - "error"    : خطأ
+          - "capture"  : معلومات الملف
+        """
+        self._append_output(msg)
+        if self.callback:
+            try:
+                self.callback(msg, msg_type)
+            except TypeError:
+                # توافق مع النسخة القديمة callback(msg)
+                self.callback(msg)
