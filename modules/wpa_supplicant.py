@@ -512,7 +512,7 @@ class WpaSupplicant:
 
         try:
             subprocess.run(["ip", "link", "set", self.iface, "up"],
-                          capture_output=True, timeout=5)
+                          capture_output=True, text=True, timeout=5)
         except Exception:
             pass
         time.sleep(1)
@@ -520,7 +520,7 @@ class WpaSupplicant:
         # Kill existing on this interface
         try:
             subprocess.run(["wpa_cli", "-i", self.iface, "terminate"],
-                          capture_output=True, timeout=3)
+                          capture_output=True, text=True, timeout=3)
             time.sleep(1)
         except Exception:
             pass

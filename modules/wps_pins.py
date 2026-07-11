@@ -633,7 +633,9 @@ FALLBACK_PINS = [
 
 
 # ═══════════════════════════════════════════════════════════
-# VULNERABLE ROUTER MODELS (1000+)
+# VULNERABLE ROUTER MODEL / VENDOR PATTERNS
+# Exact model-family strings stay separate from broad vendor heuristics.
+# A vendor name alone must never be treated as a confirmed vulnerability.
 # ═══════════════════════════════════════════════════════════
 
 VULN_MODELS = [
@@ -961,10 +963,76 @@ def get_best_pin(bssid, wps_version="", wps_locked="Unknown"):
     return "12345670"
 
 
-def is_vulnerable_model(model, device_name):
-    """Check if model is in vulnerable list"""
-    search = "{m} {d}".format(m=model or "", d=device_name or "").upper()
-    for pattern in VULN_MODELS:
+GENERIC_VENDOR_PATTERNS = [
+    "TP-LINK", "TPLINK", "D-LINK", "ASUS", "NETGEAR", "LINKSYS",
+    "HUAWEI", "ZTE", "XIAOMI", "TENDA", "ARCADYAN", "SAGEMCOM",
+    "TECHNICOLOR", "THOMSON", "UBIQUITI", "UNIFI", "AVM",
+    "FRITZ!BOX", "FRITZ!REPEATER", "ORANGE", "LIVEBOX", "SFR",
+    "BOUYGUES", "FREE", "MAROC TELECOM", "IAM", "INWI", "WANA",
+    "KEENETIC", "ZYXEL", "MERCUSYS", "CUDY", "GL.INET", "GL-INET",
+    "REYEE", "RUIJIE", "MIKROTIK", "ROUTERBOARD", "GOOGLE WIFI",
+    "GOOGLE NEST", "NEST WIFI", "EERO", "MERAKI", "FORTINET",
+    "FORTIAP", "FORTIWIFI", "WATCHGUARD", "SOPHOS",
+]
+
+
+VENDOR_HEURISTIC_PATTERNS = []
+KNOWN_VULNERABLE_PATTERNS = []
+for _pattern in VULN_MODELS:
+    _normalized = str(_pattern).strip().upper()
+    _has_digit = any(ch.isdigit() for ch in _normalized)
+    _is_generic = _normalized in GENERIC_VENDOR_PATTERNS
+    if _is_generic or not _has_digit or len(_normalized) < 5:
+        VENDOR_HEURISTIC_PATTERNS.append(_pattern)
+    else:
+        KNOWN_VULNERABLE_PATTERNS.append(_pattern)
+
+KNOWN_VULNERABLE_PATTERNS.sort(key=len, reverse=True)
+VENDOR_HEURISTIC_PATTERNS.sort(key=len, reverse=True)
+
+
+def _model_search_text(model, device_name):
+    return "{model} {device}".format(
+        model=model or "",
+        device=device_name or "",
+    ).upper()
+
+
+def classify_model_vulnerability(model, device_name):
+    """Classify a model string as exact vulnerable, heuristic, or unknown."""
+    search = _model_search_text(model, device_name)
+    for pattern in KNOWN_VULNERABLE_PATTERNS:
         if pattern.upper() in search:
-            return True, pattern
+            return {
+                "status": "known_vulnerable",
+                "match": pattern,
+                "message": "Known vulnerable",
+            }
+    for pattern in VENDOR_HEURISTIC_PATTERNS:
+        if pattern.upper() in search:
+            return {
+                "status": "vendor_heuristic",
+                "match": pattern,
+                "message": "Vendor heuristic — vulnerability not confirmed",
+            }
+    return {
+        "status": "unknown",
+        "match": None,
+        "message": "No confirmed vulnerable model match",
+    }
+
+
+def get_vendor_heuristic(model, device_name):
+    """Return the matched vendor heuristic, if any."""
+    classification = classify_model_vulnerability(model, device_name)
+    if classification["status"] == "vendor_heuristic":
+        return classification["match"]
+    return None
+
+
+def is_vulnerable_model(model, device_name):
+    """Backward-compatible exact vulnerable-model matcher."""
+    classification = classify_model_vulnerability(model, device_name)
+    if classification["status"] == "known_vulnerable":
+        return True, classification["match"]
     return False, None

@@ -101,7 +101,7 @@ class EvilTwin:
         # Also kill by name
         for prog in ["hostapd", "dnsmasq"]:
             try:
-                subprocess.run(["killall", prog], capture_output=True, timeout=5)
+                subprocess.run(["killall", prog], capture_output=True, text=True, timeout=5)
             except Exception:
                 pass
 
@@ -109,7 +109,7 @@ class EvilTwin:
         try:
             subprocess.run(
                 ["ip", "addr", "del", f"{self.gateway}/24", "dev", self.ap_iface],
-                capture_output=True, timeout=5
+                capture_output=True, text=True, timeout=5
             )
         except Exception:
             pass
@@ -127,7 +127,7 @@ class EvilTwin:
         ]
         for cmd in cmds:
             try:
-                subprocess.run(cmd, capture_output=True, timeout=5)
+                subprocess.run(cmd, capture_output=True, text=True, timeout=5)
             except Exception:
                 pass
 
@@ -276,7 +276,7 @@ ignore_broadcast_ssid=0
         """Start dnsmasq for DHCP + DNS"""
         # Kill existing
         try:
-            subprocess.run(["killall", "dnsmasq"], capture_output=True, timeout=5)
+            subprocess.run(["killall", "dnsmasq"], capture_output=True, text=True, timeout=5)
         except Exception:
             pass
         time.sleep(1)
@@ -350,7 +350,7 @@ log-dhcp
                     subprocess.run(
                         ["aireplay-ng", "--deauth", "5",
                          "-a", self.target_bssid, self.deauth_iface],
-                        capture_output=True, timeout=15
+                        capture_output=True, text=True, timeout=15
                     )
                 except Exception:
                     pass
@@ -395,6 +395,6 @@ def cleanup_portal():
     # Kill any leftover processes
     for prog in ["hostapd", "dnsmasq"]:
         try:
-            subprocess.run(["killall", prog], capture_output=True, timeout=5)
+            subprocess.run(["killall", prog], capture_output=True, text=True, timeout=5)
         except Exception:
             pass

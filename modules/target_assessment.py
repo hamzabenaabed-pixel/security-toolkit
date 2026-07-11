@@ -8,10 +8,10 @@ recommend the least intrusive authorized test path.
 """
 
 from modules.wps_pins import (
+    classify_model_vulnerability,
     detect_manufacturer,
     get_database_pins,
     get_pin_database_info,
-    is_vulnerable_model,
     suggest_pins,
 )
 
@@ -70,7 +70,11 @@ class TargetAssessor:
 
         manufacturer, algorithm, algorithm_confidence = detect_manufacturer(bssid)
         manufacturer = manufacturer or "Unknown"
-        vulnerable_model, vulnerable_match = is_vulnerable_model(model, device)
+        vulnerability = classify_model_vulnerability(model, device)
+        vulnerable_model = vulnerability["status"] == "known_vulnerable"
+        vulnerable_match = vulnerability["match"]
+        vendor_heuristic = vulnerability["status"] == "vendor_heuristic"
+        vendor_match = vulnerability["match"]
         database_pins = get_database_pins(bssid, limit=16)
         suggestions = suggest_pins(bssid, str(_field(network, "wps_version", "")), wps_locked)
         database_info = get_pin_database_info()
@@ -97,6 +101,12 @@ class TargetAssessor:
             warnings.append("WPA3-only target is not compatible with PMKID/WPA2 cracking")
         if essid.lower() == "hidden":
             warnings.append("Hidden ESSID requires the exact network name")
+        if vendor_heuristic:
+            warnings.append(
+                "Vendor heuristic matched {match}, but vulnerability is not confirmed without an exact model/firmware match".format(
+                    match=vendor_match
+                )
+            )
         if not self.internal_injection:
             warnings.append("Internal QCACLD interface is receive-only; injection methods are unavailable")
 
@@ -184,6 +194,9 @@ class TargetAssessor:
             "device": device,
             "vulnerable_model": vulnerable_model,
             "vulnerable_match": vulnerable_match,
+            "vendor_heuristic": vendor_heuristic,
+            "vendor_match": vendor_match,
+            "vulnerability_status": vulnerability["status"],
             "known_pin_count": len(database_pins),
             "best_pin": top_candidates[0]["pin"] if top_candidates else "",
             "pin_candidates": top_candidates,

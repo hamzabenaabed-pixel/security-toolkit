@@ -45,7 +45,7 @@ class Wpa2EvilTwin:
         ]
         for cmd in cmds:
             try:
-                subprocess.run(cmd, capture_output=True, timeout=5)
+                subprocess.run(cmd, capture_output=True, text=True, timeout=5)
             except Exception:
                 pass
 
@@ -232,7 +232,7 @@ class Wpa2EvilTwin:
 
     def _start_dnsmasq(self):
         try:
-            subprocess.run(["killall", "dnsmasq"], capture_output=True, timeout=5)
+            subprocess.run(["killall", "dnsmasq"], capture_output=True, text=True, timeout=5)
         except Exception:
             pass
         time.sleep(1)
@@ -353,13 +353,13 @@ class Wpa2EvilTwin:
                     pass
         for prog in ["hostapd", "dnsmasq"]:
             try:
-                subprocess.run(["killall", prog], capture_output=True, timeout=5)
+                subprocess.run(["killall", prog], capture_output=True, text=True, timeout=5)
             except Exception:
                 pass
         try:
             subprocess.run(
                 ["ip", "addr", "del", self.gateway + "/24", "dev", self.ap_iface],
-                capture_output=True, timeout=5
+                capture_output=True, text=True, timeout=5
             )
         except Exception:
             pass
