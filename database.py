@@ -234,6 +234,36 @@ class Database:
     def get_credentials(self):
         return self.fetch_all("SELECT * FROM credentials ORDER BY captured_at DESC")
 
+    def get_suspicious_wps_credentials(self):
+        """Find legacy WPS credentials that contain a PIN but no PSK."""
+        return self.fetch_all(
+            """SELECT * FROM credentials
+               WHERE COALESCE(pin,'') != ''
+               AND COALESCE(psk,'') = ''
+               AND (
+                   method LIKE 'Smart Attack%'
+                   OR method LIKE 'Pixie Dust%'
+                   OR method LIKE 'Direct WPS%'
+                   OR method LIKE 'Auto-WPS%'
+                   OR method LIKE 'Suggested PIN Sweep%'
+                   OR method LIKE 'Smart Best-PIN Test%'
+                   OR method LIKE 'PIN (%'
+               )
+               ORDER BY captured_at DESC"""
+        )
+
+    def delete_credentials(self, credential_ids):
+        """Delete selected credential rows by id."""
+        ids = [int(value) for value in credential_ids]
+        if not ids:
+            return 0
+        placeholders = ",".join("?" for _ in ids)
+        query = "DELETE FROM credentials WHERE id IN ({items})".format(
+            items=placeholders
+        )
+        cur = self.execute(query, tuple(ids))
+        return cur.rowcount
+
     # ── Activity Log ──
     def log(self, event_type, category, message, severity="info"):
         self.execute("INSERT INTO activity_log(event_type,category,message,severity) VALUES(?,?,?,?)",
@@ -257,8 +287,13 @@ class Database:
             return {"status": "unavailable", "prefixes": 0, "pins": 0}
 
         version = str(payload.get("database_version", "unknown"))
+        generated_at = str(payload.get("generated_at", ""))
         source_data = payload.get("source", {})
         source_name = str(source_data.get("name", "bundled_wps_db"))
+        source_url = str(source_data.get("url", ""))
+        source_sha256 = str(source_data.get("sha256", ""))
+        source_license = str(source_data.get("license", ""))
+        source_attribution = str(source_data.get("attribution", ""))
         prefixes = payload.get("prefixes", {})
         rows = []
         if isinstance(prefixes, dict):
@@ -298,6 +333,11 @@ class Database:
             metadata = {
                 "wps_database_version": version,
                 "wps_database_source": source_name,
+                "wps_database_source_url": source_url,
+                "wps_database_source_sha256": source_sha256,
+                "wps_database_license": source_license,
+                "wps_database_attribution": source_attribution,
+                "wps_database_generated_at": generated_at,
                 "wps_database_prefixes": str(len(prefixes)),
                 "wps_database_pins": str(len(rows)),
             }
@@ -328,6 +368,11 @@ class Database:
         return {
             "version": metadata.get("wps_database_version", "unavailable"),
             "source": metadata.get("wps_database_source", ""),
+            "source_url": metadata.get("wps_database_source_url", ""),
+            "source_sha256": metadata.get("wps_database_source_sha256", ""),
+            "license": metadata.get("wps_database_license", ""),
+            "attribution": metadata.get("wps_database_attribution", ""),
+            "generated_at": metadata.get("wps_database_generated_at", ""),
             "prefixes": prefix_count,
             "pins": pin_count,
         }

