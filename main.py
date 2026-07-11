@@ -36,9 +36,10 @@ from config import Config
 from database import Database
 from modules.scanner import scan_iw, get_interface_mode, get_interfaces
 from modules.wps_pins import suggest_pins, is_vulnerable_model
-from modules.attack import run_ose, analyze_target, run_smart_attack
+from modules.attack import run_wps_attack, analyze_target, run_smart_attack
+from modules.target_assessment import TargetAssessor
 from modules.monitor_mode import (
-    get_mode, enable_monitor, disable_monitor,
+    get_mode, enable_monitor, disable_monitor, set_channel,
     kill_processes, get_iw_dev, iface_up, iface_down
 )
 from modules.reports import generate_html, export_json
@@ -48,6 +49,7 @@ from modules.auto_wps import AutoWPS
 from modules.router_exploit import RouterExploiter, get_router_ip
 from modules.wordlist import WordlistGenerator
 from modules.handshake import HandshakeCapture, HandshakeAnalyzer
+from modules.passive_capture import PassiveHandshakeCapture
 from modules.hashcat_runner import HashcatRunner
 from modules.recon import NetworkRecon
 from modules.evil_twin import EvilTwin, cleanup_portal
@@ -211,14 +213,7 @@ class App:
             con.print("[warn]Not root! Some features may not work.[/]")
             time.sleep(2)
 
-        ose = self.cfg.get("ose_path")
-        if not os.path.isfile(ose):
-            con.print(f"[warn]ose.py not found at: {ose}[/]")
-            new_path = Prompt.ask("Enter ose.py path", default="")
-            if new_path:
-                self.cfg.set("ose_path", new_path)
-        else:
-            con.print(f"[ok]ose.py found: {ose}[/]")
+        con.print("[ok]Using built-in WPS Engine (WpsEngine)[/]")
 
         self.db.log("startup", "system", "WPS Toolkit started")
         time.sleep(1)
@@ -244,7 +239,8 @@ class App:
         con.print(Rule("[hdr]Network Scanner[/]", style="cyan"))
         iface = self.cfg.get("interface", "wlan0")
         mode = get_interface_mode(iface)
-        con.print(f"\n  Interface: [inf]{iface}[/]  Mode: [{'ok' if mode=='monitor' else 'warn'}]{mode}[/]")
+        ms = 'ok' if mode == 'monitor' else 'warn'
+        con.print(f"\n  Interface: [inf]{iface}[/]  Mode: [{ms}]{mode}[/]")
 
         con.print("\n  [mn]1[/] - Scan (iw dev scan)")
         con.print("  [mn]2[/] - Change Interface")
@@ -263,6 +259,14 @@ class App:
             con.print("[ok]Done[/]")
             Prompt.ask("\n[dim]Enter[/]")
             return
+
+        # Ask to clear old data
+        st = self.db.get_stats()
+        if st['total'] > 0:
+            con.print(f"\n[inf]DB has {st['total']} old networks[/]")
+            if Confirm.ask("Clear old data before scan?", default=False):
+                self.db.execute("DELETE FROM networks")
+                con.print("[ok]Old data cleared[/]")
 
         timeout = self.cfg.get("scan_timeout", 20)
         con.print(f"\n[inf]Scanning {iface} ({timeout}s)...[/]\n")
@@ -295,7 +299,8 @@ class App:
                     " [wps_on]OPEN[/]" if _get_field(n, "wps_locked") == "No" else "")
                 con.print(f"  [inf]{n['essid']}[/] ({n['bssid']}){vuln_tag}{lock_tag}")
                 if pins:
-                    con.print(f"    PINs: {', '.join(p['pin'] + '(' + p['method'] + ')' for p in pins[:4])}")
+                    pin_str = ', '.join(p['pin'] + '(' + p['method'] + ')' for p in pins[:4])
+                    con.print(f"    PINs: {pin_str}")
 
             if Confirm.ask("\n  Select targets?", default=False):
                 for n in networks:
@@ -397,18 +402,20 @@ class App:
             con.print(Rule("[hdr]Monitor Mode Manager[/]", style="cyan"))
             iface = self.cfg.get("interface", "wlan0")
             mode = get_mode(iface)
-            con.print(f"\n  Interface: [inf]{iface}[/]  Mode: [{'ok' if mode=='monitor' else 'warn'}]{mode}[/]")
+            ms = 'ok' if mode == 'monitor' else 'warn'
+            con.print(f"\n  Interface: [inf]{iface}[/]  Mode: [{ms}]{mode}[/]")
             con.print("\n  [mn]1[/] Enable Monitor  [mn]2[/] Disable Monitor")
             con.print("  [mn]3[/] Kill Processes  [mn]4[/] Interface Up")
-            con.print("  [mn]5[/] Interface Down  [mn]6[/] iw dev  [mn]0[/] Back\n")
+            con.print("  [mn]5[/] Interface Down  [mn]6[/] iw dev")
+            con.print("  [mn]7[/] Set Monitor Channel  [mn]0[/] Back\n")
 
             ch = Prompt.ask("Select", default="0")
             if ch == "0":
                 break
             elif ch == "1":
-                con.print("[warn]Will kill wpa_supplicant[/]")
+                con.print("[warn]Android Wi-Fi will be disabled temporarily.[/]")
                 if Confirm.ask("Continue?", default=True):
-                    with console_status("Enabling monitor..."):
+                    with con.status("[inf]Enabling monitor...[/]", spinner="dots"):
                         mon = enable_monitor(iface)
                     if mon:
                         con.print(f"[ok]Monitor mode: {mon}[/]")
@@ -438,6 +445,41 @@ class App:
             elif ch == "6":
                 con.print(Panel(get_iw_dev(), title="iw dev"))
                 Prompt.ask("\n[dim]Enter[/]")
+            elif ch == "7":
+                # Qualcomm can change the channel only after con_mode=4.
+                # Automatically offer to enable monitor mode instead of
+                # returning an unexplained failure while still managed.
+                if get_mode(iface) != "monitor":
+                    con.print("[warn]Interface is still managed; monitor mode is required.[/]")
+                    auto_enable = Confirm.ask("Enable monitor mode now?", default=True)
+                    if auto_enable:
+                        with con.status("[inf]Enabling monitor...[/]", spinner="dots"):
+                            monitor_iface = enable_monitor(iface)
+                        if monitor_iface:
+                            iface = monitor_iface
+                            self.cfg.set("interface", monitor_iface)
+                            con.print("[ok]Monitor mode: {iface}[/]".format(
+                                iface=monitor_iface
+                            ))
+                        else:
+                            con.print("[err]Could not enable monitor mode[/]")
+                            Prompt.ask("\n[dim]Enter[/]")
+                            continue
+                    else:
+                        Prompt.ask("\n[dim]Enter[/]")
+                        continue
+
+                channel = IntPrompt.ask("Channel", default=8)
+                width = IntPrompt.ask(
+                    "Width: 0=20MHz, 1=40MHz, 2=80MHz",
+                    default=0,
+                )
+                if set_channel(iface, channel, width):
+                    con.print("[ok]Channel set successfully[/]")
+                else:
+                    con.print("[err]Failed to set channel[/]")
+                    con.print("[dim]Verify con_mode=4 and that iwpriv exposes setMonChan.[/]")
+                Prompt.ask("\n[dim]Enter[/]")
 
     # ═══════════════════════════════════════
     # VIEW: ATTACK CENTER
@@ -449,41 +491,194 @@ class App:
             iface = self.cfg.get("interface", "wlan0")
             mode = get_mode(iface)
             tgts = self.db.get_targets()
-            con.print(f"\n  Interface: [inf]{iface}[/]  Mode: [{'ok' if mode=='monitor' else 'warn'}]{mode}[/]")
+            ms = 'ok' if mode == 'monitor' else 'warn'
+            con.print(f"\n  Interface: [inf]{iface}[/]  Mode: [{ms}]{mode}[/]")
             con.print(f"  Targets: [inf]{len(tgts)}[/]")
 
             con.print("  [mn]1[/] Smart Attack (auto PIN)")
-            con.print("  [mn]2[/] Pixie Dust  [mn]3[/] Brute Force")
+            con.print("  [mn]2[/] Pixie Dust  [mn]3[/] Suggested PIN Sweep")
             con.print("  [mn]4[/] PIN Attack  [mn]5[/] Attack from Targets")
-            con.print("  [mn]6[/] Interactive  [mn]7[/] History  [mn]8[/] OSE Sessions")
-            con.print()
-            con.print("  [hdr]WPS Engine (Direct):[/]")
-            con.print("  [mn]9[/]  Direct WPS PIN (own wpa_supplicant)")
-            con.print("  [mn]10[/] Direct Pixie Dust (collect + crack)")
-            con.print("  [mn]11[/] Direct WPS PBC")
-            con.print("  [mn]12[/] Direct Scan (wpa_engine)")
+            con.print("  [mn]6[/] History  [mn]7[/] Auto Target Assessment")
             con.print("  [mn]0[/] Back")
             ch = Prompt.ask("Select", default="0")
             if ch == "0":
                 break
             elif ch == "1":
                 self._smart_attack()
-            elif ch == "7":
-                self._show_history()
-            elif ch == "8":
-                self._show_ose_sessions()
             elif ch == "6":
-                self._interactive_attack()
-            elif ch == "9":
-                self._direct_wps_pin()
-            elif ch == "10":
-                self._direct_pixie()
-            elif ch == "11":
-                self._direct_pbc()
-            elif ch == "12":
-                self._direct_scan()
+                self._show_history()
+            elif ch == "7":
+                self._auto_target_assessment()
             elif ch in ("2","3","4","5"):
                 self._launch_attack(ch)
+
+    def _auto_target_assessment(self):
+        """Offline-first method planner backed by versioned WPS intelligence."""
+        con.clear()
+        con.print(Rule("[hdr]Auto Target Assessment[/]", style="cyan"))
+        con.print(
+            "[dim]Offline analysis first: no PIN, Pixie, PMKID or injection traffic "
+            "is sent by this assessment.[/]\n"
+        )
+
+        iface = self.cfg.get("interface", "wlan0")
+        if get_mode(iface) == "monitor":
+            con.print("[dim]Restoring managed mode for a fresh scan...[/]")
+            if not disable_monitor(iface):
+                con.print("[err]Could not restore managed mode[/]")
+                Prompt.ask("\n[dim]Enter[/]")
+                return
+            iface = "wlan0"
+            self.cfg.set("interface", iface)
+
+        bssid, essid = self._select_target(fresh_scan=True)
+        if not bssid:
+            return
+
+        network = self.db.get_network(bssid)
+        if not network:
+            network = {
+                "bssid": bssid,
+                "essid": essid,
+                "channel": 0,
+                "rssi": 0,
+                "encryption": "Unknown",
+                "has_wps": 0,
+                "wps_locked": "Unknown",
+                "wps_version": "",
+                "wps_model": "",
+                "wps_device": "",
+            }
+
+        assessor = TargetAssessor(
+            internal_monitor=True,
+            internal_injection=False,
+        )
+        report = assessor.assess(network)
+        assessment_id = self.db.save_assessment(report)
+
+        con.print("\n[hdr]Target[/]")
+        con.print("  ESSID:       [inf]{value}[/]".format(value=report["essid"]))
+        con.print("  BSSID:       [inf]{value}[/]".format(value=report["bssid"]))
+        con.print("  Channel:     {value}".format(value=report["channel"]))
+        con.print("  Signal:      {rssi} dBm ({grade})".format(
+            rssi=report["rssi"],
+            grade=report["signal_grade"],
+        ))
+        con.print("  Encryption:  {value}".format(value=report["encryption"]))
+        con.print("  Manufacturer:{value}".format(value=report["manufacturer"]))
+        con.print("  Model:       {value}".format(value=report["model"] or "Unknown"))
+
+        con.print("\n[hdr]Capability Matrix[/]")
+        wps_state = "Yes" if report["has_wps"] else "No"
+        pixie_state = "Candidate" if report["pixie_candidate"] else "No"
+        pmkid_state = "Candidate" if report["pmkid_candidate"] else "No"
+        passive_state = "Candidate" if report["passive_candidate"] else "No"
+        con.print("  WPS detected:       {value} (Lock: {lock})".format(
+            value=wps_state,
+            lock=report["wps_locked"],
+        ))
+        con.print("  Known OUI PINs:     {value}".format(
+            value=report["known_pin_count"]
+        ))
+        con.print("  Pixie Dust:         {value}".format(value=pixie_state))
+        con.print("  Managed PMKID:      {value}".format(value=pmkid_state))
+        con.print("  Passive handshake:  {value}".format(value=passive_state))
+        con.print("  Internal injection: No (QCACLD receive-only)")
+
+        con.print("\n[hdr]Intelligence Database[/]")
+        con.print("  Version:  [inf]{value}[/]".format(
+            value=report["intelligence_version"]
+        ))
+        con.print("  Prefixes: {value}".format(value=report["intelligence_prefixes"]))
+        con.print("  PINs:     {value}".format(value=report["intelligence_pins"]))
+
+        if report["has_wps"] and report["pin_candidates"]:
+            con.print("\n[hdr]Top Authorized-Test PIN Candidates[/]")
+            for index, candidate in enumerate(report["pin_candidates"][:8], 1):
+                con.print(
+                    "  {index}. {pin}  {method}  confidence:{confidence}%".format(
+                        index=index,
+                        pin=candidate["pin"],
+                        method=candidate["method"],
+                        confidence=candidate["confidence"],
+                    )
+                )
+
+        if report["warnings"]:
+            con.print("\n[hdr]Warnings[/]")
+            for warning in report["warnings"]:
+                con.print("  [warn]• {value}[/]".format(value=warning))
+
+        con.print("\n  Readiness score: [inf]{value}/100[/]".format(
+            value=report["readiness_score"]
+        ))
+        con.print("  Recommended: [ok]{value}[/]".format(
+            value=report["recommended_method"]
+        ))
+        con.print("  Saved assessment ID: {value}".format(value=assessment_id))
+
+        # Assessment is offline by design, but it can hand the selected target
+        # directly to one explicitly authorized next action.
+        actions = {}
+        next_number = 1
+        con.print("\n[hdr]Available Authorized Next Actions[/]")
+        if report["pmkid_candidate"]:
+            actions[str(next_number)] = "pmkid"
+            con.print("  [mn]{number}[/] Managed PMKID probe".format(
+                number=next_number
+            ))
+            next_number += 1
+        if report["passive_candidate"]:
+            actions[str(next_number)] = "passive"
+            con.print("  [mn]{number}[/] Passive handshake wait".format(
+                number=next_number
+            ))
+            next_number += 1
+        if report["has_wps"] and report["wps_locked"].lower() != "yes":
+            actions[str(next_number)] = "pin_sweep"
+            con.print("  [mn]{number}[/] Suggested PIN Sweep".format(
+                number=next_number
+            ))
+            next_number += 1
+            actions[str(next_number)] = "pixie"
+            con.print("  [mn]{number}[/] Pixie Dust probe".format(
+                number=next_number
+            ))
+            next_number += 1
+        con.print("  [mn]0[/] Back")
+
+        if not actions:
+            Prompt.ask("\n[dim]No compatible action. Enter[/]")
+            return
+
+        choice = Prompt.ask(
+            "Next action",
+            choices=["0"] + list(actions.keys()),
+            default="0",
+        )
+        if choice == "0":
+            return
+        if not Confirm.ask(
+            "I confirm I own this target or have explicit permission",
+            default=False,
+        ):
+            return
+
+        selected_action = actions[choice]
+        target = (report["bssid"], report["essid"])
+        preset = (report["bssid"], report["essid"], report["channel"])
+        if selected_action == "pmkid":
+            self._capture_pmkid(preset_target=target)
+        elif selected_action == "passive":
+            self._capture_passive(
+                preset_target=target,
+                preset_channel=report["channel"],
+            )
+        elif selected_action == "pin_sweep":
+            self._launch_attack("3", preset_target=preset)
+        elif selected_action == "pixie":
+            self._launch_attack("2", preset_target=preset)
 
     def _smart_attack(self):
         """Smart Attack - automatically selects best PIN"""
@@ -538,6 +733,38 @@ class App:
                 wps_lock = "Unknown"
                 channel = 0
 
+        # Smart Attack must obey the same WPS preflight as every other path.
+        if n:
+            has_wps = int(_get_field(n, "has_wps", 0) or 0)
+            try:
+                signal = int(_get_field(n, "rssi", 0) or 0)
+            except (TypeError, ValueError):
+                signal = 0
+            if not has_wps:
+                con.print("[err]WPS was not detected. Smart Attack was not started.[/]")
+                Prompt.ask("\n[dim]Enter[/]")
+                return
+            if wps_lock.lower() == "yes":
+                con.print("[err]WPS is locked. Smart Attack was not started.[/]")
+                Prompt.ask("\n[dim]Enter[/]")
+                return
+            if signal and signal <= -85:
+                con.print("[warn]Very weak signal: {signal} dBm[/]".format(
+                    signal=signal
+                ))
+                if not Confirm.ask("Continue despite unreliable signal?", default=False):
+                    return
+
+        iface = self.cfg.get("interface", "wlan0")
+        if get_mode(iface) == "monitor":
+            con.print("[warn]WPS requires managed mode. Restoring Wi-Fi...[/]")
+            if not disable_monitor(iface):
+                con.print("[err]Could not restore managed mode[/]")
+                Prompt.ask("\n[dim]Enter[/]")
+                return
+            iface = "wlan0"
+            self.cfg.set("interface", iface)
+
         # Analyze target
         analysis = analyze_target(bssid, wps_ver, wps_lock)
 
@@ -546,7 +773,8 @@ class App:
         con.print(f"  ESSID:      [inf]{essid}[/]")
         con.print(f"  Manufacturer:[warn]{analysis['manufacturer']}[/]")
         con.print(f"  Algorithm:  [cyan]{analysis['algorithm']}[/]")
-        con.print(f"  Confidence: [{'ok' if analysis['confidence']>70 else 'warn'}]{analysis['confidence']}%[/]")
+        conf_style = 'ok' if analysis['confidence'] > 70 else 'warn'
+        con.print(f"  Confidence: [{conf_style}]{analysis['confidence']}%[/]")
         con.print(f"  Best PIN:   [ok]{analysis['best_pin']}[/]")
         con.print(f"  WPS:        v{wps_ver}  Lock: {wps_lock}")
 
@@ -565,7 +793,7 @@ class App:
             con.print(f"    {i}. [{cc}]{p['pin']}[/] ({p['method']}) conf:{conf}%")
 
         con.print(f"\n  [mn]1[/] - Try best PIN first")
-        con.print("  [mn]2[/] - Smart sequence (PIN → Pixie → BF)")
+        con.print("  [mn]2[/] - Smart sequence (PIN → Pixie → PIN sweep)")
         con.print("  [mn]3[/] - Try specific PIN from list")
         con.print("  [mn]0[/] - Back\n")
 
@@ -592,27 +820,34 @@ class App:
             else:
                 con.print(f"[dim]{line}[/]")
 
-        ose_path = self.cfg.get("ose_path")
-        iface = self.cfg.get("interface")
-
         if ch == "1":
             con.print(f"\n[hdr]Trying best PIN: {analysis['best_pin']}[/]\n")
-            result = run_ose(ose_path, iface, "pin", bssid, analysis["best_pin"], output_cb)
+            result = run_wps_attack(iface, "pin", bssid, analysis["best_pin"], output_cb)
         elif ch == "2":
             con.print("\n[hdr]Smart Attack Sequence[/]\n")
-            result = run_smart_attack(ose_path, iface, bssid, wps_ver, wps_lock, output_cb)
+            result = run_smart_attack(iface, bssid, wps_ver, wps_lock, output_cb)
         elif ch == "3":
             pin_idx = IntPrompt.ask("PIN # from list", default=1)
             if 1 <= pin_idx <= len(analysis["pins"]):
                 selected_pin = analysis["pins"][pin_idx-1]["pin"]
                 con.print(f"\n[hdr]Trying: {selected_pin}[/]\n")
-                result = run_ose(ose_path, iface, "pin", bssid, selected_pin, output_cb)
+                result = run_wps_attack(iface, "pin", bssid, selected_pin, output_cb)
             else:
                 con.print("[err]Invalid selection[/]")
                 Prompt.ask("\n[dim]Enter[/]")
                 return
         else:
-            result = run_ose(ose_path, iface, "pin", bssid, analysis["best_pin"], output_cb)
+            result = run_wps_attack(iface, "pin", bssid, analysis["best_pin"], output_cb)
+
+        for attempt in result.get("attempts", []):
+            self.db.record_wps_attempt(
+                bssid=bssid,
+                pin=attempt.get("pin", ""),
+                status=attempt.get("status", "unknown"),
+                response=attempt.get("response", ""),
+                duration=attempt.get("duration", 0),
+                session_id=sid,
+            )
 
         # Save results
         end_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -661,11 +896,19 @@ class App:
             channel = IntPrompt.ask("Channel", default=0)
             return bssid, essid, channel
 
-    def _launch_attack(self, ch):
+    def _launch_attack(self, ch, preset_target=None):
         con.clear()
         con.print(Rule("[hdr]Launch Attack[/]", style="cyan"))
 
-        if ch == "5":
+        if preset_target:
+            bssid, essid, channel = preset_target
+            bssid = str(bssid).upper()
+            essid = str(essid)
+            try:
+                channel = int(channel)
+            except (TypeError, ValueError):
+                channel = 0
+        elif ch == "5":
             # Attack from targets
             tgts = self.db.get_targets()
             if not tgts:
@@ -731,50 +974,115 @@ class App:
             Prompt.ask("\n[dim]Enter[/]")
             return
 
-        # Show vulnerability analysis
+        # Show vulnerability analysis. Database rows are sqlite3.Row objects,
+        # so access every network field through _get_field instead of .get().
         n = self.db.get_network(bssid)
         if n:
             pins = suggest_pins(bssid)[:8]
-            is_vuln, match = is_vulnerable_model(
-                n.get("wps_model",""), n.get("wps_device",""))
+            model = str(_get_field(n, "wps_model", "") or "")
+            device = str(_get_field(n, "wps_device", "") or "")
+            wps_version = str(_get_field(n, "wps_version", "") or "")
+            wps_locked = str(_get_field(n, "wps_locked", "Unknown") or "Unknown")
+            has_wps = int(_get_field(n, "has_wps", 0) or 0)
+            try:
+                signal = int(_get_field(n, "rssi", 0) or 0)
+            except (TypeError, ValueError):
+                signal = 0
 
-            con.print(f"\n  [hdr]Vulnerability Analysis[/]")
-            con.print(f"  ESSID:  [inf]{essid}[/]")
-            con.print(f"  BSSID:  [inf]{bssid}[/]")
-            con.print(f"  Model:  {n.get('wps_model','') or 'Unknown'}")
-            con.print(f"  Device: {n.get('wps_device','') or 'Unknown'}")
-            con.print(f"  WPS:    v{n.get('wps_version','')}  Lock: {n.get('wps_locked','?')}")
+            is_vuln, match = is_vulnerable_model(model, device)
+
+            con.print("\n  [hdr]Vulnerability Analysis[/]")
+            con.print("  ESSID:  [inf]{essid}[/]".format(essid=essid))
+            con.print("  BSSID:  [inf]{bssid}[/]".format(bssid=bssid))
+            con.print("  Model:  {model}".format(model=model or "Unknown"))
+            con.print("  Device: {device}".format(device=device or "Unknown"))
+            con.print("  WPS:    v{version}  Lock: {lock}".format(
+                version=wps_version,
+                lock=wps_locked,
+            ))
+
+            if not has_wps:
+                con.print("[err]This scan did not detect WPS on the target.[/]")
+                Prompt.ask("\n[dim]Enter[/]")
+                return
+            if wps_locked.lower() == "yes":
+                con.print("[err]WPS is locked. Online PIN attempts were not started.[/]")
+                Prompt.ask("\n[dim]Enter[/]")
+                return
+            if signal and signal <= -85:
+                con.print(
+                    "[warn]Very weak signal ({signal} dBm). WPS exchanges may time out "
+                    "or cause false Wrong PIN results.[/]".format(signal=signal)
+                )
+                if not Confirm.ask("Continue despite weak signal?", default=False):
+                    return
+
             if is_vuln:
-                con.print(f"  Status: [ok]Known Vulnerable: {match}[/]")
+                con.print("  Status: [ok]Known Vulnerable: {match}[/]".format(
+                    match=match
+                ))
             if pins:
                 con.print("  [ok]Suggested PINs:[/]")
-                for i, p in enumerate(pins[:6], 1):
-                    con.print(f"    {i}. [ok]{p['pin']}[/] ({p['method']})")
+                for index, pin_info in enumerate(pins[:6], 1):
+                    con.print("    {index}. [ok]{pin}[/] ({method})".format(
+                        index=index,
+                        pin=pin_info["pin"],
+                        method=pin_info["method"],
+                    ))
         else:
             pins = suggest_pins(bssid)[:5]
+            signal = 0
+            wps_locked = "Unknown"
 
-        # Attack type
-        atype_map = {"2":"pixie","3":"bruteforce","4":"pin","5":"auto"}
+        # Attack type. Menu 4 is always a specific PIN; menu 5 uses the
+        # smart best-PIN path for a saved target.
+        atype_map = {
+            "2": "pixie",
+            "3": "bruteforce",
+            "4": "pin",
+            "5": "smart",
+        }
         atype = atype_map.get(ch, "pixie")
-
-        if ch == "4":
-            con.print("\n  [mn]1[/] Pixie Dust  [mn]2[/] Brute Force  [mn]3[/] PIN")
-            a = Prompt.ask("Attack type", default="1")
-            atype = {"1":"pixie","2":"bruteforce","3":"pin"}.get(a, "pixie")
 
         pin = None
         if atype == "pin":
             default_pin = pins[0]["pin"] if pins else ""
             pin = Prompt.ask("PIN", default=default_pin)
 
-        names = {"pixie":"Pixie Dust","bruteforce":"Brute Force",
-                 "pin":f"PIN ({pin})","auto":"Auto"}
+        pin_name = "PIN ({pin})".format(pin=pin)
+        names = {
+            "pixie": "Pixie Dust",
+            "bruteforce": "Suggested PIN Sweep",
+            "pin": pin_name,
+            "smart": "Smart Best-PIN Test",
+        }
         aname = names.get(atype, "Unknown")
 
-        con.print(f"\n[hdr]{aname} on {essid} ({bssid})[/]")
-        con.print(f"  Method: [ok]ose.py[/]  Interface: [inf]{self.cfg.get('interface')}[/]")
+        attack_iface = self.cfg.get("interface", "wlan0")
+        if get_mode(attack_iface) == "monitor":
+            con.print("[warn]WPS requires managed mode. Restoring Wi-Fi...[/]")
+            if not disable_monitor(attack_iface):
+                con.print("[err]Could not restore managed mode[/]")
+                Prompt.ask("\n[dim]Enter[/]")
+                return
+            attack_iface = "wlan0"
+            self.cfg.set("interface", attack_iface)
 
-        if not Confirm.ask("\n  Start attack?", default=True):
+        con.print("\n[hdr]{name} on {essid} ({bssid})[/]".format(
+            name=aname,
+            essid=essid,
+            bssid=bssid,
+        ))
+        con.print("  Method: [ok]WPS Engine[/]  Interface: [inf]{iface}[/]".format(
+            iface=attack_iface
+        ))
+        if atype == "bruteforce":
+            con.print(
+                "[warn]Controlled mode: tries only high-priority calculated/default "
+                "PINs. It is not an exhaustive 11,000-PIN attack.[/]"
+            )
+
+        if not Confirm.ask("\n  Start authorized test?", default=True):
             return
 
         # Create session
@@ -796,10 +1104,32 @@ class App:
             else:
                 con.print(f"[dim]{line}[/]")
 
-        result = run_ose(
-            self.cfg.get("ose_path"), self.cfg.get("interface"),
-            atype, bssid, pin, output_cb
+        skip_pins = set()
+        if atype == "bruteforce":
+            skip_pins = self.db.get_attempted_wps_pins(bssid)
+            if skip_pins:
+                con.print("[dim]Resume database: {count} PINs already tried[/]".format(
+                    count=len(skip_pins)
+                ))
+
+        result = run_wps_attack(
+            attack_iface,
+            atype,
+            bssid,
+            pin,
+            output_cb,
+            skip_pins=skip_pins,
         )
+
+        for attempt in result.get("attempts", []):
+            self.db.record_wps_attempt(
+                bssid=bssid,
+                pin=attempt.get("pin", ""),
+                status=attempt.get("status", "unknown"),
+                response=attempt.get("response", ""),
+                duration=attempt.get("duration", 0),
+                session_id=sid,
+            )
 
         # Save results
         end_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -826,26 +1156,7 @@ class App:
 
         Prompt.ask("\n[dim]Enter[/]")
 
-    def _interactive_attack(self):
-        con.clear()
-        con.print(Rule("[hdr]Interactive Mode[/]", style="cyan"))
-        con.print("\n[yellow]ose.py will scan and let you select target[/]")
-        con.print("[dim]Press Enter to refresh, number to select, Ctrl+C to return[/]\n")
-        if not Confirm.ask("Start?", default=True):
-            return
-        import subprocess
-        cmd = [sys.executable, self.cfg.get("ose_path"),
-               "-i", self.cfg.get("interface"), "-D"]
-        con.print(f"[dim]Running: {' '.join(cmd)}[/]\n")
-        try:
-            proc = subprocess.Popen(cmd)
-            proc.wait()
-        except KeyboardInterrupt:
-            try:
-                proc.terminate()
-            except Exception:
-                pass
-        Prompt.ask("\n[dim]Enter[/]")
+
 
     def _show_history(self):
         con.clear()
@@ -873,23 +1184,7 @@ class App:
         con.print(t)
         Prompt.ask("\n[dim]Enter[/]")
 
-    def _show_ose_sessions(self):
-        con.clear()
-        con.print(Rule("[hdr]OSE Session Files[/]", style="cyan"))
-        from pathlib import Path
-        home = Path.home()
-        for name, path in [("Pixiewps", ".OneShot-Extended/pixiewps"),
-                          ("Sessions", ".OneShot-Extended/sessions")]:
-            d = home / path
-            if d.exists():
-                files = list(d.glob("*"))
-                if files:
-                    con.print(f"\n[yellow]{name}:[/]")
-                    for f in files:
-                        con.print(f"  {f.name} -> {f.read_text().strip()[:50]}")
-                else:
-                    con.print(f"[dim]{name}: empty[/]")
-        Prompt.ask("\n[dim]Enter[/]")
+
 
     # ═══════════════════════════════════════
     # VIEW: LIVE MONITOR
@@ -1088,7 +1383,7 @@ class App:
         """Direct WPS PIN attack using own wpa_supplicant"""
         con.clear()
         con.print(Rule("[hdr]Direct WPS PIN Attack[/]", style="cyan"))
-        con.print("[dim]Uses own wpa_supplicant instance (like ose.py)[/]\n")
+        con.print("[dim]Direct wpa_supplicant WPS PIN attack[/]\n")
 
         bssid = self._select_network()
         if not bssid:
@@ -1285,7 +1580,7 @@ class App:
                 con.print("[err]pixiewps not installed![/]")
         else:
             con.print("[warn]Not enough data for pixiewps[/]")
-            con.print("[dim]Try: ose.py with --pixie-dust flag[/]")
+            con.print("[dim]Try: run Pixie Dust from Attack Center menu[/]")
 
         Prompt.ask("\n[dim]Enter[/]")
 
@@ -1706,7 +2001,7 @@ class App:
             elif ch == "1":
                 essid = Prompt.ask("ESSID (network name)")
                 brand = Prompt.ask("Brand (TP-Link/ZTE/Huawei/etc)", default="")
-                max_w = IntPrompt.ask("Max words", default=10000)
+                max_w = IntPrompt.ask("Max words", default=100000)
 
                 con.print(f"\n[inf]Generating wordlist for '{essid}'...[/]")
                 gen = WordlistGenerator()
@@ -1769,14 +2064,15 @@ class App:
         while True:
             con.clear()
             con.print(Rule("[hdr]Handshake Capture & Analysis[/]", style="cyan"))
-            con.print("[dim]Captures handshake via wpa_supplicant - no monitor mode needed[/]")
+            con.print("[dim]Managed PMKID requests and passive authorized handshakes[/]")
             con.print()
-            con.print("  [mn]1[/] - Capture PMKID (fast)")
-            con.print("  [mn]2[/] - Capture Full Handshake")
-            con.print("  [mn]3[/] - Capture from Targets")
-            con.print("  [mn]4[/] - Analyze Captures")
-            con.print("  [mn]5[/] - List All Captures")
-            con.print("  [mn]6[/] - Crack Command")
+            con.print("  [mn]1[/] - Capture PMKID (managed mode)")
+            con.print("  [mn]2[/] - Passive Real Handshake (monitor mode)")
+            con.print("  [mn]3[/] - M1/M2 Diagnostic (dummy PSK)")
+            con.print("  [mn]4[/] - Capture PMKID from Targets")
+            con.print("  [mn]5[/] - Analyze Captures")
+            con.print("  [mn]6[/] - List All Captures")
+            con.print("  [mn]7[/] - Crack Command")
             con.print("  [mn]0[/] - Back\n")
 
             ch = Prompt.ask("Select", default="0")
@@ -1785,39 +2081,137 @@ class App:
             elif ch == "1":
                 self._capture_pmkid()
             elif ch == "2":
-                self._capture_full()
+                self._capture_passive()
             elif ch == "3":
-                self._capture_batch()
+                self._capture_full()
             elif ch == "4":
-                self._analyze_captures()
+                self._capture_batch()
             elif ch == "5":
-                self._list_captures()
+                self._analyze_captures()
             elif ch == "6":
+                self._list_captures()
+            elif ch == "7":
                 self._crack_cmd()
 
-    def _select_target(self):
-        nets = self.db.get_all_networks()
-        if nets:
-            net_table(nets, "Select Target")
-            sel = Prompt.ask("# or BSSID", default="1")
-            try:
-                idx = int(sel)
-                if 1 <= idx <= len(nets):
-                    n = nets[idx-1]
-                    return str(_get_field(n, "bssid")), str(_get_field(n, "essid", "Hidden"))
-            except ValueError:
-                pass
-            return sel.strip().upper(), "Unknown"
-        return Prompt.ask("BSSID").strip().upper(), Prompt.ask("ESSID", default="Unknown")
+    def _select_target(self, fresh_scan=False):
+        """Select from a fresh radio scan, not a cumulative database list."""
+        nets = []
 
-    def _capture_pmkid(self):
+        if fresh_scan:
+            preferred_iface = self.cfg.get("interface", "wlan0")
+            timeout = self.cfg.get("scan_timeout", 20)
+            scan_ifaces = [preferred_iface]
+            for available_iface in get_interfaces():
+                if available_iface not in scan_ifaces:
+                    scan_ifaces.append(available_iface)
+
+            scanned = []
+            scan_source = ""
+
+            # First try iw on the configured interface, then every other
+            # managed interface. On this phone wlan0 and wlan1 share phy0,
+            # but often only one of them accepts a scan request.
+            for scan_iface in scan_ifaces:
+                con.print("\n[inf]Fresh iw scan on {iface}...[/]".format(
+                    iface=scan_iface
+                ))
+                try:
+                    candidate = scan_iw(scan_iface, timeout, wps_only=False)
+                except Exception as exc:
+                    con.print("[warn]Scan failed on {iface}: {err}[/]".format(
+                        iface=scan_iface, err=exc
+                    ))
+                    candidate = []
+                if candidate:
+                    scanned = candidate
+                    scan_source = "iw/{iface}".format(iface=scan_iface)
+                    break
+
+            # If direct iw scan is rejected by the Android driver, use the
+            # scan cache of an already-running wpa_supplicant instance.
+            if not scanned:
+                for scan_iface in scan_ifaces:
+                    wpa = WpaSupplicant(scan_iface)
+                    if not wpa.is_running():
+                        continue
+                    con.print("[inf]Trying wpa_cli scan on {iface}...[/]".format(
+                        iface=scan_iface
+                    ))
+                    try:
+                        candidate = wpa.scan_results()
+                    except Exception as exc:
+                        con.print("[warn]wpa_cli failed on {iface}: {err}[/]".format(
+                            iface=scan_iface, err=exc
+                        ))
+                        candidate = []
+                    if candidate:
+                        scanned = candidate
+                        scan_source = "wpa_cli/{iface}".format(iface=scan_iface)
+                        break
+
+            # Show every AP from this scan. The Enc column tells the user
+            # which ones are WPA2 candidates; do not hide networks because
+            # one vendor's iw output used an unexpected RSN format.
+            nets = scanned
+            wpa2_count = 0
+            for network in nets:
+                security = str(_get_field(network, "encryption", "")).upper()
+                if "WPA2" in security:
+                    wpa2_count += 1
+                self.db.add_network(network)
+
+            if nets:
+                con.print(
+                    "[ok]{count} current networks via {source}; "
+                    "{wpa2} detected as WPA2[/]\n".format(
+                        count=len(nets), source=scan_source, wpa2=wpa2_count
+                    )
+                )
+            else:
+                tried = ", ".join(scan_ifaces) if scan_ifaces else preferred_iface
+                con.print("[warn]No current scan results from: {ifaces}[/]".format(
+                    ifaces=tried
+                ))
+                use_saved = Confirm.ask("Use saved database entries instead?", default=False)
+                if use_saved:
+                    nets = self.db.get_all_networks()
+        else:
+            nets = self.db.get_all_networks()
+
+        if nets:
+            net_table(nets, "Fresh Targets" if fresh_scan else "Select Target")
+            sel = Prompt.ask("# or M for manual", default="1")
+            if sel.strip().lower() != "m":
+                try:
+                    idx = int(sel)
+                    if 1 <= idx <= len(nets):
+                        network = nets[idx - 1]
+                        bssid = str(_get_field(network, "bssid"))
+                        essid = str(_get_field(network, "essid", "Hidden"))
+                        return bssid, essid
+                except ValueError:
+                    pass
+                con.print("[warn]Invalid selection; enter the target manually.[/]")
+
+        bssid = Prompt.ask("BSSID", default="").strip().upper()
+        if not bssid:
+            return "", ""
+        essid = Prompt.ask("ESSID (exact, case-sensitive)", default="Unknown")
+        return bssid, essid
+
+    def _capture_pmkid(self, preset_target=None):
         con.clear()
         con.print(Rule("[hdr]PMKID Capture[/]", style="cyan"))
-        bssid, essid = self._select_target()
+        con.print("[warn]A PMKID is available only when the AP includes one in M1/RSN.\n" +
+                  "Retries cannot force an AP that does not expose PMKID.[/]\n")
+        if preset_target:
+            bssid, essid = preset_target
+        else:
+            bssid, essid = self._select_target(fresh_scan=True)
         if not bssid:
             return
         con.print(f"\n  Target: [inf]{essid}[/] ({bssid})\n")
-        iface = self.cfg.get("interface", "wlan1")
+        iface = self.cfg.get("interface", "wlan0")
         cap = HandshakeCapture(iface)
         cap.callback = lambda l: con.print(f"[dim]{l}[/]")
         try:
@@ -1828,15 +2222,151 @@ class App:
         if result.get("pmkid"):
             con.print(f"  PMKID: [ok]{result['pmkid']}[/]")
             con.print(f"  Crack: [cyan]hashcat -m 22000 <file> wordlist.txt[/]")
-        if result.get("files"):
             for f in result["files"]:
-                con.print(f"  File: [dim]{f}[/]")
+                if 'pmkid_' in f:
+                    con.print(f"  File: [ok]{f}[/]")
+        else:
+            con.print("[warn]No PMKID was exposed by this AP.[/]")
+            con.print("[dim]Valid alternatives for an authorized audit: WPS testing in managed mode,\n"
+                      "or an external USB Wi-Fi adapter for a real passive handshake capture.[/]")
+        Prompt.ask("\n[dim]Enter[/]")
+
+    def _capture_passive(self, preset_target=None, preset_channel=None):
+        """Capture an authorized client handshake on a fixed monitor channel."""
+        con.clear()
+        con.print(Rule("[hdr]Passive Real Handshake[/]", style="cyan"))
+        con.print(
+            "[warn]Authorized testing only. This mode does not deauthenticate clients.\n"
+            "Use another device that you own: disconnect it, start capture, then\n"
+            "reconnect it using the real network password.[/]\n"
+        )
+
+        iface = self.cfg.get("interface", "wlan0")
+        if get_mode(iface) == "monitor":
+            con.print("[dim]Restoring managed mode temporarily for the target scan...[/]")
+            disable_monitor(iface)
+            iface = "wlan0"
+            self.cfg.set("interface", iface)
+
+        if preset_target:
+            bssid, essid = preset_target
+        else:
+            bssid, essid = self._select_target(fresh_scan=True)
+        if not bssid:
+            return
+
+        saved = self.db.get_network(bssid)
+        default_channel = 8
+        if preset_channel:
+            try:
+                default_channel = int(preset_channel)
+            except (TypeError, ValueError):
+                default_channel = 8
+        if saved:
+            if not preset_channel:
+                try:
+                    saved_channel = int(_get_field(saved, "channel", 0))
+                    if saved_channel > 0:
+                        default_channel = saved_channel
+                except (TypeError, ValueError):
+                    pass
+
+            try:
+                saved_rssi = int(_get_field(saved, "rssi", 0))
+            except (TypeError, ValueError):
+                saved_rssi = 0
+            if saved_rssi <= -85:
+                con.print(
+                    "[warn]Very weak target signal ({rssi} dBm). Move closer; "
+                    "EAPOL data frames are harder to receive than beacons.[/]".format(
+                        rssi=saved_rssi
+                    )
+                )
+
+            security = str(_get_field(saved, "encryption", "Unknown")).upper()
+            if security in ("WEP", "OPEN"):
+                con.print(
+                    "[warn]Scanner currently reports {security}. WPA EAPOL "
+                    "handshakes do not exist on that security type.[/]".format(
+                        security=security
+                    )
+                )
+
+        channel = IntPrompt.ask("Target channel", default=default_channel)
+        width_default = 0
+        width = IntPrompt.ask(
+            "Width: 0=20MHz, 1=40MHz, 2=80MHz",
+            default=width_default,
+        )
+        duration = IntPrompt.ask("Capture duration in seconds", default=60)
+
+        con.print("\n  Target: [inf]{essid}[/] ({bssid})".format(
+            essid=essid,
+            bssid=bssid,
+        ))
+        con.print("  Channel: [inf]{channel}[/]  Duration: [inf]{duration}s[/]\n".format(
+            channel=channel,
+            duration=duration,
+        ))
+        con.print(
+            "[hdr]Prepare the authorized client now:[/]\n"
+            "  1. Turn Wi-Fi off on the second device.\n"
+            "  2. Start this capture.\n"
+            "  3. Turn Wi-Fi on and reconnect to the target during the timer.\n"
+        )
+
+        if not Confirm.ask("Start passive capture?", default=True):
+            return
+
+        capture = PassiveHandshakeCapture(iface)
+        capture.callback = lambda line: con.print("[dim]{line}[/]".format(line=line))
+
+        try:
+            result = capture.capture(
+                bssid=bssid,
+                essid=essid,
+                channel=channel,
+                width=width,
+                duration=duration,
+                restore=True,
+            )
+        except KeyboardInterrupt:
+            result = {"status": "stopped", "files": []}
+        finally:
+            self.cfg.set("interface", "wlan0")
+
+        status = result.get("status", "failed")
+        con.print("\n  Status: [inf]{status}[/]".format(status=status))
+        con.print("  Target EAPOL: {count}".format(
+            count=result.get("eapol_frames", 0)
+        ))
+        con.print("  Authorized hashes: {count}".format(
+            count=result.get("hashes", 0)
+        ))
+
+        if status == "handshake_captured":
+            con.print("[ok]Real authorized handshake captured and validated.[/]")
+        elif status == "challenge_only":
+            con.print("[warn]Only a challenge pair was found. Reconnect a client"
+                      " that knows the real password.[/]")
+        elif status == "no_eapol":
+            con.print("[warn]No EAPOL for this BSSID. Verify the channel and retry.[/]")
+        elif status == "missing_tools":
+            missing = ", ".join(result.get("missing", []))
+            con.print("[err]Missing tools: {items}[/]".format(items=missing))
+
+        for filepath in result.get("files", []):
+            con.print("  File: [dim]{path}[/]".format(path=filepath))
         Prompt.ask("\n[dim]Enter[/]")
 
     def _capture_full(self):
         con.clear()
-        con.print(Rule("[hdr]Full Handshake Capture[/]", style="cyan"))
-        bssid, essid = self._select_target()
+        con.print(Rule("[hdr]M1/M2 Diagnostic[/]", style="cyan"))
+        con.print("[warn]Important: M2 generated here uses a random dummy PSK.\n"
+                  "It tests EAPOL parsing, but it cannot reveal the AP's real password.\n"
+                  "A real crackable handshake requires a legitimate client handshake\n"
+                  "captured with monitor-capable hardware.[/]\n")
+        bssid, essid = self._select_target(fresh_scan=True)
         if not bssid:
             return
         con.print(f"\n  Target: [inf]{essid}[/] ({bssid})\n")
@@ -2017,7 +2547,8 @@ class App:
                 con.print("[inf]Generating wordlist...[/]")
                 from modules.wordlist import WordlistGenerator
                 gen = WordlistGenerator()
-                words = gen.generate_for_network(essid, brand=brand, max_words=10000)
+                max_wl = IntPrompt.ask("Max words", default=100000)
+                words = gen.generate_for_network(essid, brand=brand, max_words=max_wl)
                 wl_path = "/tmp/wl_smart.txt"
                 with open(wl_path, "w") as f:
                     for w in words: f.write(w + "\n")
@@ -2563,9 +3094,9 @@ class App:
             for k, v in self.cfg.data.items():
                 t.add_row(k, str(v))
             con.print(Panel(t, title="Settings", border_style="cyan"))
-            con.print("\n  [mn]1[/] Interface  [mn]2[/] ose.py Path")
-            con.print("  [mn]3[/] Scan Timeout  [mn]4[/] Toggle Verbose")
-            con.print("  [mn]5[/] Backup  [mn]6[/] Reset  [mn]0[/] Back\n")
+            con.print("\n  [mn]1[/] Interface  [mn]2[/] Scan Timeout")
+            con.print("  [mn]3[/] Toggle Verbose  [mn]4[/] Backup")
+            con.print("  [mn]5[/] Reset  [mn]0[/] Back\n")
             ch = Prompt.ask("Select", default="0")
             if ch == "0":
                 break
@@ -2573,17 +3104,14 @@ class App:
                 v = Prompt.ask("Interface", default=self.cfg.get("interface"))
                 self.cfg.set("interface", v); con.print("[ok]Done[/]")
             elif ch == "2":
-                v = Prompt.ask("Path", default=self.cfg.get("ose_path"))
-                self.cfg.set("ose_path", v); con.print("[ok]Done[/]")
-            elif ch == "3":
                 v = IntPrompt.ask("Timeout", default=self.cfg.get("scan_timeout"))
                 self.cfg.set("scan_timeout", v); con.print("[ok]Done[/]")
             elif ch == "4":
                 v = not self.cfg.get("verbose")
                 self.cfg.set("verbose", v); con.print(f"[ok]Verbose: {v}[/]")
-            elif ch == "5":
+            elif ch == "4":
                 con.print(f"[ok]{self.db.backup()}[/]")
-            elif ch == "6":
+            elif ch == "5":
                 if Confirm.ask("[err]Reset?[/]"):
                     self.cfg.data = self.cfg.DEFAULTS.copy()
                     self.cfg.save(); con.print("[ok]Done[/]")

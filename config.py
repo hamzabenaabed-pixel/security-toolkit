@@ -9,14 +9,12 @@ DB_PATH = APP_DIR / "data" / "wps.db"
 CFG_PATH = APP_DIR / "data" / "config.json"
 REPORTS_DIR = APP_DIR / "reports"
 LOGS_DIR = APP_DIR / "logs"
-OSE_PATH = APP_DIR.parent / "ose.py"
 
 for d in [APP_DIR / "data", REPORTS_DIR, LOGS_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 DEFAULTS = {
     "interface": "wlan0",
-    "ose_path": str(OSE_PATH),
     "scan_timeout": 20,
     "auto_backup": True,
     "dont_touch_settings": True,
