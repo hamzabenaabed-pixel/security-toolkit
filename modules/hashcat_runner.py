@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Default modern WPA hash mode for hashcat: 22000
+DEFAULT_WPA_HASHCAT_MODE = 22000
 """
 Hashcat Runner v5 - Multi-threaded PMKID + Full Handshake Cracker
 - Full handshake (WPA*02) مع HMAC-SHA1-128 فوق EAPOL frame

